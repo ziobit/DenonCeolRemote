@@ -2,13 +2,16 @@
 /*
   CEOL SKIN STUDIO V8
 
-  Denon CEOL / RCD-N9 TCP/IP Remote
+  Denon CEOL / RCD-N9 Network Remote
   Single-file PHP 7.2 webapp, no Bootstrap, no database.
 
-  Deploy this file on a PHP server inside the same LAN as the Denon, or on a
-  server with a VPN route into that LAN. A hosted PHP server cannot reach your
-  private Denon IP just because the browser running at home can reach it.
-  The browser talks to PHP; PHP talks to the Denon over TCP port 23.
+  Connection settings offer two explicit modes; failures never switch modes.
+  Server relay (default): PHP reaches the Denon over TCP port 23 or the selected
+  HTTP command fallback. The PHP host needs access to the Denon LAN or a VPN.
+  Browser direct: JavaScript reaches the Denon HTTP goform API from the user's
+  LAN; PHP only serves the UI, preferences, theme studio, and updater. Browser
+  mixed-content, CORS, and local/private-network policies still apply. Opaque
+  replies cannot confirm delivery or read status; displayed changes are estimates.
 
   Theme studio: open "Theme editor" and create your admin password on first use.
   Right-click an item for properties; drag it or resize it with the selection handles.
@@ -39,7 +42,7 @@ const DENON_CONNECT_TIMEOUT_SECONDS = 1.2;
 const DENON_DEFAULT_READ_MS = 900;
 const ALLOW_PUBLIC_DENON_IP = false; // Keep false unless this app is firewalled and you know what you are doing.
 const APP_TITLE = 'CEOL N9 Micro Command Deck';
-const APP_VERSION = '8.1.0';
+const APP_VERSION = '8.2.0';
 const APP_ID = 'ziobit/DenonCeolRemote';
 const CEOL_UPDATE_URL = 'https://raw.githubusercontent.com/ziobit/DenonCeolRemote/main/index.php';
 const CEOL_REPOSITORY_URL = 'https://github.com/ziobit/DenonCeolRemote';
@@ -323,23 +326,19 @@ function denon_http_get_quiet(string $url, int $timeoutSeconds = 2): array {
   return array('ok' => true, 'body' => $body, 'error' => '');
 }
 
+function denon_http_command_path(string $command): string {
+  $command = normalize_command($command);
+  if (!is_allowed_denon_command($command)) throw new RuntimeException('Command not allowed: ' . $command);
+  $paths = array('PWON' => '/goform/formiPhoneAppPower.xml?1+PowerOn',
+    'PWSTANDBY' => '/goform/formiPhoneAppPower.xml?1+PowerStandby',
+    'MUON' => '/goform/formiPhoneAppMute.xml?1+MuteOn', 'MUOFF' => '/goform/formiPhoneAppMute.xml?1+MuteOff');
+  return isset($paths[$command]) ? $paths[$command] : '/goform/formiPhoneAppDirect.xml?' . rawurlencode($command);
+}
+
 function denon_http_fallback_command(string $ip, string $command): array {
   $command = normalize_command($command);
-  $path = '';
-
-  if ($command === 'PWON') {
-    $path = '/goform/formiPhoneAppPower.xml?1+PowerOn';
-  } elseif ($command === 'PWSTANDBY') {
-    $path = '/goform/formiPhoneAppPower.xml?1+PowerStandby';
-  } elseif ($command === 'MUON') {
-    $path = '/goform/formiPhoneAppMute.xml?1+MuteOn';
-  } elseif ($command === 'MUOFF') {
-    $path = '/goform/formiPhoneAppMute.xml?1+MuteOff';
-  } elseif (is_allowed_denon_command($command)) {
-    $path = '/goform/formiPhoneAppDirect.xml?' . rawurlencode($command);
-  } else {
-    return array('ok' => false, 'error' => 'Command not allowed for HTTP fallback.', 'lines' => array());
-  }
+  if (!is_allowed_denon_command($command)) return array('ok' => false, 'error' => 'Command not allowed for HTTP fallback.', 'lines' => array());
+  $path = denon_http_command_path($command);
 
   // RCD-N9 field reports often use HTTPS; many Denon devices also accept HTTP.
   $tries = array('http://' . $ip . $path, 'https://' . $ip . $path, 'http://' . $ip . ':8080' . $path);
@@ -509,7 +508,21 @@ function ceol_preset_ids(): array {
 
 function ceol_default_preferences(): array {
   return array('schema' => 1, 'revision' => 0, 'activeTheme' => 'porcelain', 'activeView' => 'mini',
-    'denonIp' => '', 'useHttpFallback' => false, 'customThemes' => array());
+    'denonIp' => '', 'connectionMode' => 'relay', 'directScheme' => 'http', 'directPort' => 80,
+    'directReadback' => false, 'useHttpFallback' => false, 'customThemes' => array());
+}
+
+function ceol_connection_settings(array $input, array $current): array {
+  $next = $current;
+  if (isset($input['connectionMode'])) $next['connectionMode'] = ceol_choice($input['connectionMode'], array('relay', 'direct'));
+  if (isset($input['directScheme'])) $next['directScheme'] = ceol_choice($input['directScheme'], array('http', 'https'));
+  if (isset($input['directPort'])) {
+    $port = filter_var($input['directPort'], FILTER_VALIDATE_INT, array('options' => array('min_range' => 1, 'max_range' => 65535)));
+    if ($port === false) throw new RuntimeException('Use a Denon HTTP port from 1 to 65535.');
+    $next['directPort'] = $port;
+  }
+  if (isset($input['directReadback'])) $next['directReadback'] = ceol_choice($input['directReadback'], array('0', '1')) === '1';
+  return $next;
 }
 
 function ceol_read_json(string $file, string $guard, array $fallback): array {
@@ -1013,7 +1026,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['ajax'])) {
     }
 
     try {
-      $prefs = ceol_update_preferences(function ($prefs) use ($ip) { $prefs['denonIp'] = $ip; return $prefs; });
+      $prefs = ceol_update_preferences(function ($prefs) use ($ip) {
+        $prefs = ceol_connection_settings($_POST, $prefs);
+        $prefs['denonIp'] = $ip;
+        return $prefs;
+      });
     } catch (Throwable $error) {
       json_out(array('ok' => false, 'error' => $error->getMessage()));
     }
@@ -1029,6 +1046,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['ajax'])) {
     }
     unset($_SESSION['denon_ip']);
     json_out(array('ok' => true, 'preferences' => $prefs));
+  }
+
+  // A stale tab/client must not accidentally relay while direct mode is selected.
+  if (in_array($action, array('command', 'status', 'test', 'volume_set', 'favorite'), true)) {
+    try {
+      if (ceol_preferences()['connectionMode'] === 'direct') {
+        http_response_code(409);
+        json_out(array('ok' => false, 'error' => 'Browser direct is selected. No PHP-to-Denon request was made. Reload this page or explicitly select Server relay in Connection settings.'));
+      }
+    } catch (Throwable $error) {
+      json_out(array('ok' => false, 'error' => $error->getMessage()));
+    }
   }
 
   $ip = current_denon_ip();
@@ -1120,9 +1149,12 @@ try {
   $ceolStorageError = $error->getMessage();
 }
 if ($ceolPrefs['denonIp'] === '') $ceolPrefs['denonIp'] = $configuredIp;
+$ceolHttpPaths = array();
+foreach (allowed_fixed_commands() as $command) $ceolHttpPaths[$command] = denon_http_command_path($command);
 $ceolBoot = array('preferences' => $ceolPrefs, 'csrf' => $_SESSION['ceol_csrf'],
   'setupRequired' => empty($ceolSecurity['passwordHash']), 'authenticated' => ceol_editor_authenticated($ceolSecurity),
-  'allowedCommands' => allowed_fixed_commands(), 'storageError' => $ceolStorageError,
+  'allowedCommands' => allowed_fixed_commands(), 'httpCommandPaths' => $ceolHttpPaths,
+  'allowPublicDenonIp' => ALLOW_PUBLIC_DENON_IP, 'sourceLabels' => source_labels(), 'storageError' => $ceolStorageError,
   'version' => APP_VERSION);
 header('Cache-Control: no-store, private');
 header('X-Content-Type-Options: nosniff');
@@ -1224,6 +1256,8 @@ header('Referrer-Policy: same-origin');
     .check-field input { accent-color:var(--accent); }
     .message { font-size:12px; color:var(--muted); min-height:20px; line-height:1.5; }
     .message.error { color:#ce4444; }
+    .connection-notice { margin:14px 0; padding:12px 14px; border:1px solid var(--border); border-radius:12px; background:var(--surface); font-size:12px; line-height:1.6; overflow-wrap:anywhere; }
+    .connection-notice.error { border-color:#ce4444; }
     .theme-group { margin:24px 0 8px; font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:.1em; }
     .theme-grid { display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); gap:12px; }
     .theme-card { text-align:left; background:var(--surface); color:var(--text); border:1px solid var(--border); border-radius:13px; padding:8px; }
@@ -1333,7 +1367,7 @@ header('Referrer-Policy: same-origin');
       </div>
       <div class="header-actions">
         <div class="status"><span class="dot" id="connDot"></span><span id="connText">Offline</span></div>
-        <button class="ui-btn" id="connectionButton" type="button" title="Change Denon IP"><span data-icon="network"></span><span id="ipText"><?= h($configuredIp !== '' ? $configuredIp : 'Connect') ?></span></button>
+        <button class="ui-btn" id="connectionButton" type="button" title="Connection settings"><span data-icon="network"></span><span id="ipText"><?= h($configuredIp !== '' ? $configuredIp : 'Connect') ?></span></button>
         <button class="ui-btn" id="themesButton" type="button"><span data-icon="disc"></span>Themes</button>
         <button class="ui-btn" id="editorButton" type="button"><span data-icon="sliders"></span>Theme editor</button>
       </div>
@@ -1345,17 +1379,29 @@ header('Referrer-Policy: same-origin');
         <button id="fullViewButton" type="button">All commands</button>
       </div>
     </div>
+    <div class="connection-notice" id="connectionNotice" role="status" aria-live="polite" hidden></div>
     <section class="runtime-stage mini" id="runtimeStage" aria-label="Denon remote">
       <div class="canvas-viewport" id="runtimeViewport"><div class="skin-canvas" id="runtimeCanvas"></div></div>
     </section>
-    <footer class="app-footer"><span>CEOL / RCD-N9 · TCP/IP remote</span><span id="footerState">Ready when you are.</span><span class="inline"><span>v<?= h(APP_VERSION) ?></span><button class="update-link" id="checkUpdatesButton" type="button">Check for updates</button></span></footer>
+    <footer class="app-footer"><span id="transportText">CEOL / RCD-N9 · Server relay</span><span id="footerState">Ready when you are.</span><span class="inline"><span>v<?= h(APP_VERSION) ?></span><button class="update-link" id="checkUpdatesButton" type="button">Check for updates</button></span></footer>
   </main>
 
   <div class="overlay" id="ipModal" hidden>
     <form class="dialog" id="ipForm">
       <div class="dialog-head"><h2>Connect your CEOL</h2><button class="ui-btn icon" type="button" data-close="ipModal" aria-label="Close">×</button></div>
-      <p>Enter the Denon IP address. The PHP server sends the commands and must have access to the Denon’s local network, directly or through a VPN. Enable Network Control on the Denon.</p>
+      <p>Enable Network Control on the Denon, then choose which computer reaches it. A failed request stays in the selected mode.</p>
       <label class="field"><span>Denon IPv4 address</span><input id="denonIpInput" placeholder="192.168.1.45" value="<?= h($configuredIp) ?>" inputmode="decimal" autocomplete="off" required></label>
+      <label class="field"><span>Connection mode</span><select id="connectionModeInput"><option value="relay">Server relay · PHP → Denon</option><option value="direct">Browser direct · this browser → Denon</option></select></label>
+      <p id="connectionHelp">Server relay needs the PHP host to reach the Denon LAN, locally or through a VPN.</p>
+      <div id="directSettings" hidden>
+        <div class="form-row">
+          <label class="field"><span>Denon protocol</span><select id="directSchemeInput"><option value="http">HTTP</option><option value="https">HTTPS</option></select></label>
+          <label class="field"><span>Denon HTTP port</span><input id="directPortInput" type="number" min="1" max="65535" value="80" required></label>
+        </div>
+        <label class="field"><span>HTTP replies</span><select id="directReadbackInput"><option value="0">Dispatch only · replies unreadable (no-cors)</option><option value="1">Check HTTP replies · requires Denon CORS</option></select></label>
+        <p>Dispatch-only replies cannot confirm delivery, HTTP errors, or live status. Direct-mode displays are estimates; Refresh and Test send only a PW? probe. Check HTTP replies detects readable HTTP errors but still does not provide full live status.</p>
+        <p id="directPolicyHelp" class="message"></p>
+      </div>
       <div class="message error" id="ipError"></div>
       <button class="ui-btn primary" type="submit">Save & connect</button>
     </form>
@@ -1598,6 +1644,8 @@ header('Referrer-Policy: same-origin');
     let authPurpose = 'editor', updateInfo = null, updateChecking = false, updateInstalling = false;
     let dismissedUpdateVersion = '', pendingUpdateOffer = false;
     let remoteQueue = [];
+    let connectionEpoch = 0, connectionSaving = false;
+    const DIRECT_TIMEOUT_MS = 6000;
     function themes() { return presets.concat(preferences.customThemes || []); }
     function findTheme(id) { return themes().find(theme => theme.id === id) || presets[0]; }
     function currentLayout() { return draft.layouts[editView]; }
@@ -1741,7 +1789,8 @@ header('Referrer-Policy: same-origin');
     paletteButton('Custom command','Custom command button','MV20','send');
     [['display','Live display'],['volume','Volume readout'],['slider','Volume slider'],['state','Power status'],['favorite','Favorite selector'],['manual','Manual command field'],['fallback','HTTP fallback switch'],['log','Command log'],['label','Text label'],['panel','Background panel']]
       .forEach(c=>palette.push({group:'Widgets & decoration',label:c[1],kind:c[0],action:'',icon:'none'}));
-    function validAction(action) { return ['toggle_power','toggle_mute','refresh','test'].includes(action) || bootData.allowedCommands.includes(action) || /^MV([0-5][0-9]|60)$/.test(action) || /^FV(0[1-9]|[1-4][0-9]|50)$/.test(action) || /^TFAN[0-9]{6}$/.test(action); }
+    function validCommand(command) { return bootData.allowedCommands.includes(command) || /^MV([0-5][0-9]|60)$/.test(command) || /^FV(0[1-9]|[1-4][0-9]|50)$/.test(command) || /^TFAN[0-9]{6}$/.test(command); }
+    function validAction(action) { return ['toggle_power','toggle_mute','refresh','test'].includes(action) || validCommand(action); }
     function newId(prefix) { const bytes=new Uint8Array(8);crypto.getRandomValues(bytes);return prefix+'-'+Array.from(bytes,b=>b.toString(16).padStart(2,'0')).join(''); }
     function renderPalette() {
       const query=$('paletteSearch').value.toLowerCase(),target=$('commandPalette');target.replaceChildren();let group='';
@@ -2005,7 +2054,104 @@ header('Referrer-Policy: same-origin');
       finally{themeSaving=false;updateDraftStatus();}
     }
 
-    function setConnection(online,label) { $('connDot').classList.toggle('online',online);$('connText').textContent=label || (online?'Online':'Offline'); }
+    function isDirectMode() { return preferences.connectionMode === 'direct'; }
+    function directTarget() {
+      const ip=String(preferences.denonIp || '');
+      const parts=ip.split('.').map(Number);
+      const valid=/^(0|[1-9][0-9]{0,2})(\.(0|[1-9][0-9]{0,2})){3}$/.test(ip) && parts.every(n=>n<=255);
+      const local=valid && (parts[0]===10 || parts[0]===127 || (parts[0]===172 && parts[1]>=16 && parts[1]<=31) ||
+        (parts[0]===192 && parts[1]===168) || (parts[0]===169 && parts[1]===254));
+      if(!valid || (!local && !bootData.allowPublicDenonIp))throw new Error('Browser direct needs a valid private Denon IPv4 address.');
+      const scheme=preferences.directScheme,port=Number(preferences.directPort);
+      if(!['http','https'].includes(scheme) || !Number.isInteger(port) || port<1 || port>65535)throw new Error('Check the Denon HTTP protocol and port in Connection settings.');
+      return {base:scheme+'://'+ip+':'+port,local,loopback:parts[0]===127};
+    }
+    function directCommandPath(command) {
+      if(!validCommand(command))throw new Error('Command not allowed: '+command);
+      return bootData.httpCommandPaths[command] || '/goform/formiPhoneAppDirect.xml?'+encodeURIComponent(command);
+    }
+    function setConnectionNotice(text,error=false) {
+      $('connectionNotice').textContent=text;$('connectionNotice').hidden=!text;$('connectionNotice').classList.toggle('error',error);
+    }
+    function directModeNotice() {
+      const policy=location.protocol==='https:' && preferences.directScheme==='http'
+        ? ' HTTPS → HTTP can be blocked as mixed content. Supporting browsers may allow it after Local Network Access permission.' : '';
+      return 'Browser direct · '+(preferences.directReadback?'HTTP replies require Denon CORS.':'Dispatch only: replies are opaque; delivery and HTTP status are unconfirmed.')+
+        ' Power, source, mute, and volume are estimates. Live status polling is off; Refresh/Test only probe PW?.'+policy;
+    }
+    function updateConnectionInfo() {
+      $('ipText').textContent=preferences.denonIp || 'Connect';
+      $('transportText').textContent='CEOL / RCD-N9 · '+(isDirectMode()?'Browser direct':'Server relay');
+      setConnectionNotice(isDirectMode()?directModeNotice():'');
+      updateLiveDisplays();
+    }
+    async function checkDirectPermission(target) {
+      if(!target.local || !navigator.permissions || !navigator.permissions.query)return;
+      // Unsupported permission names are normal in other/older browsers.
+      for(const name of [target.loopback?'loopback-network':'local-network','local-network-access']) {
+        let permission;
+        try{permission=await navigator.permissions.query({name});}catch(error){continue;}
+        if(permission.state==='denied')throw new Error('Local/private-network access is denied by this browser or site policy. Allow Local Network Access in site settings, or explicitly select Server relay.');
+        break;
+      }
+    }
+    function staleConnectionError() { const error=new Error('Connection settings changed; the old request was discarded.');error.staleConnection=true;return error; }
+    async function directSend(command,epoch) {
+      const target=directTarget(),url=target.base+directCommandPath(command),readback=!!preferences.directReadback;
+      await checkDirectPermission(target);
+      if(epoch!==connectionEpoch)throw staleConnectionError();
+      const controller=new AbortController();
+      const timer=setTimeout(()=>controller.abort(),DIRECT_TIMEOUT_MS);
+      try {
+        const options={method:'GET',mode:readback?'cors':'no-cors',cache:'no-store',credentials:'omit',referrerPolicy:'no-referrer',redirect:'error',signal:controller.signal};
+        if(target.local && typeof Request!=='undefined' && 'targetAddressSpace' in Request.prototype)options.targetAddressSpace=target.loopback?'loopback':'local';
+        const response=await fetch(url,options);
+        if(response.type!=='opaque' && !response.ok)throw new Error('Denon returned HTTP '+response.status+' at '+target.base+'. Check the port and goform endpoint.');
+        if(readback && response.type==='opaque')throw new Error('The Denon reply is opaque; CORS readback was requested but is unavailable.');
+        clearTimeout(timer);
+        // Retain the relay's pacing, including the power-on settling delay.
+        await new Promise(resolve=>setTimeout(resolve,command==='PWON'?1000:80));
+        // Do not promote an opaque response into an acknowledgement or real state.
+        return {ok:true,direct:true,replyVerified:response.type!=='opaque',httpStatus:response.status,command,lines:[]};
+      } catch(error) {
+        if(controller.signal.aborted)throw new Error('Browser direct timed out after '+(DIRECT_TIMEOUT_MS/1000)+' seconds at '+target.base+'. The command may have reached the Denon; it was not retried. Check device power, Network Control, IP/port, and browser Local Network Access.');
+        if(error instanceof TypeError) {
+          const mixed=location.protocol==='https:' && target.base.startsWith('http:');
+          throw new Error('Browser direct failed at '+target.base+'. '+(mixed?'HTTPS → HTTP may be blocked as mixed content. ':'')+
+            (readback?'CORS readback may be blocked. ':'')+'Local/private-network policy, TLS trust, or an unreachable device can also cause this error. JavaScript cannot distinguish these causes; inspect the browser console/Network panel and open the Denon web interface from this browser. The command may have reached the device; it was not retried through PHP.');
+        }
+        throw error;
+      } finally { clearTimeout(timer); }
+    }
+    async function remoteRequest(action,data={}) {
+      const epoch=connectionEpoch,mode=preferences.connectionMode || 'relay';
+      if(!['relay','direct'].includes(mode))throw new Error('Select a valid connection mode.');
+      let command;
+      if(action==='command')command=String(data.command || '').trim().toUpperCase();
+      else if(action==='volume_set')command='MV'+String(clamp(Math.trunc(Number(data.value) || 0),0,60)).padStart(2,'0');
+      else if(action==='favorite')command='FV'+String(clamp(Math.trunc(Number(data.value) || 1),1,50)).padStart(2,'0');
+      else if(['status','test'].includes(action))command='PW?';
+      else throw new Error('Unknown remote action.');
+      if(!validCommand(command))throw new Error('Command not allowed: '+command);
+      try { return mode==='direct'?await directSend(command,epoch):await api(action,action==='command'?Object.assign({},data,{command}):data); }
+      finally { if(epoch!==connectionEpoch)throw staleConnectionError(); }
+    }
+    function estimateDirectCommand(command) {
+      if(['PWON','PWSTANDBY'].includes(command)){liveState.power=command==='PWON'?'on':'standby';liveState.powerLabel=command==='PWON'?'On':'Standby';}
+      if(['MUON','MUOFF'].includes(command))liveState.mute=command==='MUON';
+      if(/^MV[0-9]{2}$/.test(command))liveState.volumeNumber=Number(command.slice(2));
+      if(bootData.sourceLabels[command]){liveState.sourceRaw=command;liveState.sourceLabel=bootData.sourceLabels[command];}
+      updateLiveDisplays();
+    }
+    function remoteFailure(error) {
+      if(error.staleConnection)return;
+      setConnection(false,isDirectMode()?'Direct · Failed':'Relay · Failed');setLog('FAIL '+error.message);
+      if(isDirectMode()) {
+        stopHolding();remoteQueue.splice(0).forEach(task=>task.resolve());
+        setConnectionNotice(error.message+' Pending commands stopped. Browser direct remains selected; no relay fallback was attempted.',true);
+      }
+    }
+    function setConnection(online,label) { $('connDot').classList.toggle('online',online);$('connText').textContent=label || (online?'Relay · Online':'Relay · Offline'); }
     function setLog(text) {
       logLines.unshift('['+new Date().toLocaleTimeString()+'] '+text);logLines=logLines.slice(0,70);
       document.querySelectorAll('[data-live="log"]').forEach(el=>el.textContent=logLines.join('\n'));
@@ -2025,12 +2171,12 @@ header('Referrer-Policy: same-origin');
       updateLiveDisplays();
     }
     function updateLiveDisplays() {
-      document.querySelectorAll('[data-live="volume"]').forEach(el=>el.textContent=liveState.volumeNumber===null?'--':String(liveState.volumeNumber).padStart(2,'0'));
+      document.querySelectorAll('[data-live="volume"]').forEach(el=>{el.textContent=liveState.volumeNumber===null?'--':String(liveState.volumeNumber).padStart(2,'0');el.title=isDirectMode()?'Estimated volume; direct mode has no live status readback.':'Volume';});
       document.querySelectorAll('[data-live="slider"]').forEach(el=>{if(document.activeElement!==el)el.value=liveState.volumeNumber || 0;});
-      document.querySelectorAll('[data-live="fallback"]').forEach(el=>el.checked=preferences.useHttpFallback);
+      document.querySelectorAll('[data-live="fallback"]').forEach(el=>{el.checked=preferences.useHttpFallback;el.disabled=isDirectMode() || editorOpen;el.title=isDirectMode()?'HTTP fallback applies only to Server relay.':'Use HTTP instead of TCP for relay commands.';});
       const tuner=[liveState.tunerFrequencyLabel,liveState.tunerStationName,liveState.tunerMode].filter(Boolean).join(' · ');
       const values={power:liveState.powerLabel || 'Unknown',source:liveState.sourceLabel || 'Unknown',mute:typeof liveState.mute==='boolean'?(liveState.mute?'Muted':'Live'):'Unknown',tuner:tuner || '—'};
-      document.querySelectorAll('[data-live="state"]').forEach(el=>{el.textContent=values[el.dataset.key];el.title=values[el.dataset.key];});
+      document.querySelectorAll('[data-live="state"]').forEach(el=>{const value=values[el.dataset.key];el.textContent=value+(isDirectMode() && !['Unknown','—'].includes(value)?' (est.)':'');el.title=value;});
       document.querySelectorAll('[data-live="display"]').forEach(el=>{
         const indexes=el.dataset.view==='mini'?[0,1,4,5]:[0,1,2,3,4,5,6,7,8];el.replaceChildren();
         indexes.forEach(index=>{const text=(liveState.display[index] || '').trim();el.append(makeText('div','display-line'+(text?'':' empty'),text || '····················'));});
@@ -2051,30 +2197,38 @@ header('Referrer-Policy: same-origin');
         }
       });
     }
-    function handleRemoteResult(result,label) { setConnection(true);mergeState(result.state,result.lines || []);setLog(result.lines && result.lines.length?'RX '+result.lines.join(' | '):label+' · accepted'); }
-    // Keep TCP requests serial, and retain a tap made while a status poll is in progress.
+    function handleRemoteResult(result,label) {
+      if(result.direct) {
+        estimateDirectCommand(result.command);
+        setConnection(result.replyVerified,result.replyVerified?'Direct · HTTP replied':'Direct · Unconfirmed');
+        setConnectionNotice(directModeNotice());
+        setLog('DIRECT '+result.command+(result.replyVerified?' · HTTP '+result.httpStatus+' replied':' · dispatched; delivery unconfirmed')+
+          (result.command==='PW?'?' · live status unavailable':' · displayed changes are estimates'));
+      } else { setConnection(true);mergeState(result.state,result.lines || []);setLog(result.lines && result.lines.length?'RX '+result.lines.join(' | '):label+' · accepted'); }
+    }
+    // Both transports use this queue; never retry a failed command in another mode.
     function enqueueRemote(operation,key='') {
-      if(editorOpen)return Promise.resolve();
+      if(editorOpen || connectionSaving)return Promise.resolve();
       return new Promise(resolve=>{
         if(key){const pending=remoteQueue.find(task=>task.key===key);if(pending){pending.resolve();pending.operation=operation;pending.resolve=resolve;return;}}
         if(remoteQueue.length>=20){notice('The remote is catching up. Try again in a moment.');resolve();return;}
-        remoteQueue.push({operation,key,resolve});drainRemote();
+        remoteQueue.push({operation,key,resolve,epoch:connectionEpoch});drainRemote();
       });
     }
     async function drainRemote() {
       if(busy || editorOpen || !remoteQueue.length)return;
       const task=remoteQueue.shift();busy=true;
-      try{await task.operation();}finally{busy=false;task.resolve();drainRemote();}
+      try{if(task.epoch===connectionEpoch)await task.operation();}finally{busy=false;task.resolve();drainRemote();}
     }
     function sendCommand(command) {
       return enqueueRemote(async()=>{
-        const actual=typeof command==='function'?command():command;
+        const actual=String(typeof command==='function'?command():command).trim().toUpperCase();
         const oldState=clone(liveState);setLog('TX '+actual);
         if(actual==='MVUP' && liveState.volumeNumber!==null)updateVolume(liveState.volumeNumber+1);
         if(actual==='MVDOWN' && liveState.volumeNumber!==null)updateVolume(liveState.volumeNumber-1);
         if(['MUON','MUOFF'].includes(actual)){liveState.mute=actual==='MUON';updateLiveDisplays();}
-        try { const result=await api('command',{command:actual,httpFallback:preferences.useHttpFallback?'1':'0'});handleRemoteResult(result,actual); }
-        catch(error){liveState=oldState;updateLiveDisplays();setConnection(false,'Error');setLog('FAIL '+error.message);}
+        try { const result=await remoteRequest('command',{command:actual,httpFallback:preferences.useHttpFallback?'1':'0'});handleRemoteResult(result,actual); }
+        catch(error){if(error.staleConnection)return;liveState=oldState;updateLiveDisplays();remoteFailure(error);}
       });
     }
     function runAction(action) {
@@ -2096,36 +2250,38 @@ header('Referrer-Policy: same-origin');
       face.addEventListener('pointerleave',stopHolding);face.addEventListener('lostpointercapture',stopHolding);
     }
     async function refreshStatus(manual=false) {
-      if(!preferences.denonIp)return;
+      if(!preferences.denonIp || connectionSaving || (isDirectMode() && !manual))return;
       if(manual && !editorOpen)return enqueueRemote(async()=>{
-        try{handleRemoteResult(await api('status'),'Status');}catch(error){setConnection(false,'Offline');setLog(error.message);}
+        try{handleRemoteResult(await remoteRequest('status'),'Status');}catch(error){remoteFailure(error);}
       },'status');
       if(busy)return;busy=true;
-      try{handleRemoteResult(await api('status'),'Status');}
-      catch(error){setConnection(false,'Offline');if(manual)setLog(error.message);}
+      try{handleRemoteResult(await remoteRequest('status'),'Status');}
+      catch(error){if(!error.staleConnection){setConnection(false,'Relay · Offline');if(manual)remoteFailure(error);}}
       finally{busy=false;drainRemote();}
     }
     function testConnection() {
       return enqueueRemote(async()=>{
-        setConnection(false,'Testing');try{handleRemoteResult(await api('test'),'Connection test');}catch(error){setConnection(false,'Offline');setLog(error.message);}
+        setConnection(false,'Testing');try{handleRemoteResult(await remoteRequest('test'),'Connection test');}catch(error){remoteFailure(error);}
       });
     }
     function setVolume(value) {
-      const volume=clamp(Number(value) || 0,0,60);
+      const volume=clamp(Math.trunc(Number(value) || 0),0,60);
       return enqueueRemote(async()=>{
         const old=liveState.volumeNumber;updateVolume(volume);setLog('TX MV'+String(volume).padStart(2,'0'));
-        try{handleRemoteResult(await api('volume_set',{value:volume}),'Volume');}catch(error){liveState.volumeNumber=old;updateLiveDisplays();setLog(error.message);setConnection(false,'Error');}
+        try{handleRemoteResult(await remoteRequest('volume_set',{value:volume}),'Volume');}catch(error){if(error.staleConnection)return;liveState.volumeNumber=old;updateLiveDisplays();remoteFailure(error);}
       },'volume');
     }
     function favoriteGo(input) {
       const value=clamp(parseInt(input.value,10) || 1,1,50);input.value=value;
       return enqueueRemote(async()=>{
         setLog('TX FV'+String(value).padStart(2,'0'));
-        try{handleRemoteResult(await api('favorite',{value}),'Favorite');}catch(error){setLog(error.message);setConnection(false,'Error');}
+        try{handleRemoteResult(await remoteRequest('favorite',{value}),'Favorite');}catch(error){remoteFailure(error);}
       });
     }
-    function startPolling() {
-      clearInterval(pollTimer);refreshStatus(true);pollTimer=setInterval(()=>{if(!document.hidden)refreshStatus();},3000);
+    function startPolling(probeDirect=false) {
+      clearInterval(pollTimer);pollTimer=null;updateConnectionInfo();
+      if(isDirectMode()){setConnection(false,'Direct · Ready');if(probeDirect)refreshStatus(true);return;}
+      refreshStatus(true);pollTimer=setInterval(()=>{if(!document.hidden)refreshStatus();},3000);
     }
 
     function updateBusy(busy) {
@@ -2206,24 +2362,57 @@ header('Referrer-Policy: same-origin');
     }
     function showModal(id,focusId) { stopHolding();$(id).hidden=false;if(focusId)$(focusId).focus(); }
     function hideModal(id) {
+      if(id==='ipModal' && connectionSaving)return;
       if(id==='updateModal' && updateInstalling)return;
       if(id==='updateModal'){dismissedUpdateVersion=updateInfo && updateInfo.available?updateInfo.latestVersion:'';pendingUpdateOffer=false;}
       $(id).hidden=true;
     }
+    function renderConnectionHelp() {
+      const direct=$('connectionModeInput').value==='direct';
+      $('directSettings').hidden=!direct;
+      ['directSchemeInput','directPortInput','directReadbackInput'].forEach(id=>$(id).disabled=!direct);
+      $('connectionHelp').textContent=direct?'This browser must reach the Denon LAN. The PHP host only serves the app and saves settings; it does not connect to the Denon.':'The PHP host must reach the Denon LAN, locally or through a VPN. Its existing HTTP command fallback remains available in All commands.';
+      $('directPolicyHelp').textContent=location.protocol==='https:' && $('directSchemeInput').value==='http'
+        ? 'HTTPS → HTTP may be blocked as mixed content. Supporting browsers can request Local Network Access permission. Other browsers may need the app served over HTTP on your LAN, or a trusted Denon HTTPS endpoint.'
+        : 'Browser Local/Private Network Access policies still apply. HTTPS needs a certificate trusted by this browser. CORS readback requires the Denon to allow this app’s origin.';
+    }
+    function showConnectionSettings() {
+      $('denonIpInput').value=preferences.denonIp || '';
+      $('connectionModeInput').value=preferences.connectionMode || 'relay';
+      $('directSchemeInput').value=preferences.directScheme || 'http';
+      $('directPortInput').value=preferences.directPort || 80;
+      $('directReadbackInput').value=preferences.directReadback?'1':'0';
+      $('ipError').textContent='';renderConnectionHelp();showModal('ipModal','denonIpInput');
+    }
+    async function saveConnection(ev) {
+      ev.preventDefault();if(connectionSaving)return;
+      const button=ev.submitter || $('ipForm').querySelector('[type="submit"]');button.disabled=true;$('ipError').textContent='';
+      connectionSaving=true;stopHolding();clearInterval(pollTimer);
+      connectionEpoch++;remoteQueue.splice(0).forEach(task=>task.resolve());
+      const data={ip:$('denonIpInput').value.trim(),connectionMode:$('connectionModeInput').value};
+      if(data.connectionMode==='direct')Object.assign(data,{directScheme:$('directSchemeInput').value,directPort:$('directPortInput').value,directReadback:$('directReadbackInput').value});
+      try {
+        const result=await api('save_ip',data);preferences=result.preferences;
+        liveState={power:'unknown',mute:null,volumeNumber:null,display:[],sourceRaw:''};
+        connectionSaving=false;hideModal('ipModal');setLog('Connection saved: '+(isDirectMode()?'Browser direct':'Server relay')+' · '+result.ip);startPolling(true);
+      } catch(error){$('ipError').textContent=error.message;connectionSaving=false;startPolling();}
+      finally {button.disabled=false;}
+    }
     $('checkUpdatesButton').addEventListener('click',()=>checkForUpdates(true));
     $('retryUpdateButton').addEventListener('click',()=>checkForUpdates(true));
     $('installUpdateButton').addEventListener('click',installUpdate);
-    $('connectionButton').addEventListener('click',()=>showModal('ipModal','denonIpInput'));
+    $('connectionButton').addEventListener('click',showConnectionSettings);
+    $('connectionModeInput').addEventListener('change',renderConnectionHelp);
+    $('directSchemeInput').addEventListener('change',()=>{
+      if(['80','443'].includes($('directPortInput').value))$('directPortInput').value=$('directSchemeInput').value==='https'?'443':'80';
+      renderConnectionHelp();
+    });
     $('themesButton').addEventListener('click',()=>{renderThemeGallery();showModal('themesModal');});
     $('editorButton').addEventListener('click',requestEditor);
     $('miniViewButton').addEventListener('click',()=>saveSelection({view:'mini'}));$('fullViewButton').addEventListener('click',()=>saveSelection({view:'full'}));
     document.querySelectorAll('[data-close]').forEach(btn=>btn.addEventListener('click',()=>hideModal(btn.dataset.close)));
     document.querySelectorAll('.overlay').forEach(overlay=>overlay.addEventListener('pointerdown',ev=>{if(ev.target===overlay)hideModal(overlay.id);}));
-    $('ipForm').addEventListener('submit',async ev=>{
-      ev.preventDefault();const button=ev.submitter || $('ipForm').querySelector('[type="submit"]');button.disabled=true;$('ipError').textContent='';
-      try{const result=await api('save_ip',{ip:$('denonIpInput').value.trim()});preferences=result.preferences;$('ipText').textContent=result.ip;hideModal('ipModal');setLog('IP configured: '+result.ip);startPolling();}
-      catch(error){$('ipError').textContent=error.message;}finally{button.disabled=false;}
-    });
+    $('ipForm').addEventListener('submit',saveConnection);
     $('authForm').addEventListener('submit',async ev=>{
       ev.preventDefault();$('authError').textContent='';const password=$('adminPassword').value;
       if(setupRequired && password!==$('confirmAdminPassword').value){$('authError').textContent='The passwords do not match.';return;}
@@ -2315,9 +2504,21 @@ header('Referrer-Policy: same-origin');
     window.addEventListener('beforeunload',ev=>{if(editorOpen && dirty()){ev.preventDefault();ev.returnValue='';}});
     window.addEventListener('resize',()=>{sizeRuntime();sizeEditorCanvas();});
     new ResizeObserver(()=>{sizeRuntime();if(editorOpen)sizeEditorCanvas();}).observe($('runtimeStage'));
-    renderPalette();applyTheme(activeTheme);setLog('Ready.');
+    renderPalette();applyTheme(activeTheme);updateConnectionInfo();setLog('Ready.');
     if(bootData.storageError)notice(bootData.storageError);
-    if(preferences.denonIp)startPolling();else showModal('ipModal','denonIpInput');
+    if(new URLSearchParams(location.search).get('connection')==='direct') {
+      // A legacy bookmark suggests direct mode; saving is still explicit.
+      showConnectionSettings();$('connectionModeInput').value='direct';renderConnectionHelp();
+      if(!preferences.denonIp) {
+        try {
+          const saved=new URL(localStorage.getItem('denon_ceol_base_url'));
+          if(['http:','https:'].includes(saved.protocol)) {
+            $('denonIpInput').value=saved.hostname;$('directSchemeInput').value=saved.protocol.slice(0,-1);
+            $('directPortInput').value=saved.port || (saved.protocol==='https:'?'443':'80');renderConnectionHelp();
+          }
+        } catch(error) { /* No usable legacy target. */ }
+      }
+    } else if(preferences.denonIp)startPolling();else showConnectionSettings();
     setTimeout(()=>checkForUpdates(),1500);
     setInterval(()=>{if(!document.hidden)checkForUpdates();},6*60*60*1000);
     setInterval(offerPendingUpdate,2000);
