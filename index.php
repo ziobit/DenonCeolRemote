@@ -14,6 +14,10 @@
   denon-ceol-preferences.json and the guarded .denon-ceol-admin.php credential data.
   To reset a forgotten password, remove .denon-ceol-admin.php from the server,
   then create a new password in the editor. Built-in themes are never overwritten.
+  Updates: the app checks this repository's main/index.php over verified HTTPS.
+  Bump APP_VERSION for each release. Installation requires confirmation and the
+  admin password. Settings stay in their local files. To recover manually, remove
+  the first line of .denon-ceol-backup.php and restore it as index.php.
 
   Important Denon setting:
   Enable Network Control / IP Control on the Denon, otherwise standby control may fail.
@@ -33,7 +37,12 @@ const DENON_CONNECT_TIMEOUT_SECONDS = 1.2;
 const DENON_DEFAULT_READ_MS = 900;
 const ALLOW_PUBLIC_DENON_IP = false; // Keep false unless this app is firewalled and you know what you are doing.
 const APP_TITLE = 'CEOL N9 Micro Command Deck';
-const APP_VERSION = 'skin-studio-v8-2026-10-03';
+const APP_VERSION = '8.1.0';
+const APP_ID = 'ziobit/DenonCeolRemote';
+const CEOL_UPDATE_URL = 'https://raw.githubusercontent.com/ziobit/DenonCeolRemote/main/index.php';
+const CEOL_REPOSITORY_URL = 'https://github.com/ziobit/DenonCeolRemote';
+const CEOL_UPDATE_CACHE_SECONDS = 3600;
+const CEOL_UPDATE_MAX_BYTES = 2097152;
 
 function json_out(array $payload): void {
   header('Content-Type: application/json; charset=utf-8');
@@ -545,6 +554,190 @@ function ceol_require_csrf(): void {
   }
 }
 
+// Only the fixed upstream file is fetched. Never use the Denon's HTTP helper here:
+// GitHub requests must verify both the TLS certificate and hostname.
+function ceol_download_update(): string {
+  $source = '';
+  if (function_exists('curl_init')) {
+    $request = curl_init(CEOL_UPDATE_URL);
+    if ($request === false) throw new RuntimeException('Cannot start the online update check.');
+    curl_setopt_array($request, array(CURLOPT_FOLLOWLOCATION => false, CURLOPT_CONNECTTIMEOUT => 5,
+      CURLOPT_TIMEOUT => 12, CURLOPT_SSL_VERIFYPEER => true, CURLOPT_SSL_VERIFYHOST => 2,
+      CURLOPT_USERAGENT => 'DenonCeolRemote/' . APP_VERSION, CURLOPT_HTTPHEADER => array('Accept: text/plain'),
+      CURLOPT_WRITEFUNCTION => function ($handle, $chunk) use (&$source) {
+        if (strlen($source) + strlen($chunk) > CEOL_UPDATE_MAX_BYTES) return 0;
+        $source .= $chunk;
+        return strlen($chunk);
+      }));
+    $ok = curl_exec($request);
+    $status = (int)curl_getinfo($request, CURLINFO_HTTP_CODE);
+    curl_close($request);
+    if ($ok === false || $status !== 200) throw new RuntimeException('Cannot reach GitHub securely. Check internet access and the server\'s CA certificates, then try again.');
+  } else {
+    $context = stream_context_create(array('http' => array('method' => 'GET', 'timeout' => 12,
+      'follow_location' => 0, 'ignore_errors' => true,
+      'header' => "Accept: text/plain\r\nUser-Agent: DenonCeolRemote/" . APP_VERSION . "\r\n"),
+      'ssl' => array('verify_peer' => true, 'verify_peer_name' => true, 'allow_self_signed' => false)));
+    $stream = @fopen(CEOL_UPDATE_URL, 'rb', false, $context);
+    if (!$stream) throw new RuntimeException('Cannot reach GitHub securely. Enable PHP cURL or allow_url_fopen and check the server\'s CA certificates.');
+    try {
+      $metadata = stream_get_meta_data($stream);
+      $headers = isset($metadata['wrapper_data']) ? $metadata['wrapper_data'] : array();
+      if (empty($headers) || !preg_match('/^HTTP\/\S+ 200(?:\s|$)/', $headers[0])) {
+        throw new RuntimeException('GitHub did not return the update file. Try again later.');
+      }
+      $deadline = microtime(true) + 12;
+      while (!feof($stream)) {
+        $remaining = $deadline - microtime(true);
+        if ($remaining <= 0) throw new RuntimeException('The GitHub update check timed out. Try again.');
+        stream_set_timeout($stream, (int)$remaining, (int)(($remaining - (int)$remaining) * 1000000));
+        $chunk = fread($stream, 65536);
+        $metadata = stream_get_meta_data($stream);
+        if ($chunk === false || !empty($metadata['timed_out'])) throw new RuntimeException('The GitHub download was interrupted. Try again.');
+        $source .= $chunk;
+        if (strlen($source) > CEOL_UPDATE_MAX_BYTES) throw new RuntimeException('The update file exceeds the 2MB limit.');
+      }
+    } finally {
+      fclose($stream);
+    }
+  }
+  if (strlen($source) < 20000 || substr($source, 0, 5) !== '<?php') {
+    throw new RuntimeException('GitHub returned an incomplete or invalid application file. Nothing was installed.');
+  }
+  return $source;
+}
+
+function ceol_source_version(string $source): string {
+  if (!preg_match("/^const APP_VERSION = '([^']+)';[\r\n]/m", $source, $match)) {
+    throw new RuntimeException('The online file has no valid application version.');
+  }
+  $version = $match[1];
+  // Recognize the previous version label when this updater is first deployed.
+  if (preg_match('/^skin-studio-v8-\d{4}-\d{2}-\d{2}$/', $version)
+      && strpos($source, 'CEOL SKIN STUDIO V8') !== false) return '8.0.0';
+  if (!preg_match('/^(0|[1-9]\d{0,5})\.(0|[1-9]\d{0,5})\.(0|[1-9]\d{0,5})$/', $version)
+      || strpos($source, "const APP_ID = '" . APP_ID . "';") === false) {
+    throw new RuntimeException('The online file is not a versioned Denon CEOL Remote release.');
+  }
+  return $version;
+}
+
+function ceol_stage_update_file(string $file, string $source, int $mode): string {
+  $temp = @tempnam(dirname($file), '._ceol_update_');
+  if ($temp === false) throw new RuntimeException('Give PHP write permission to the application folder before updating.');
+  if (dirname($temp) !== dirname($file) || @file_put_contents($temp, $source) !== strlen($source)
+      || !@chmod($temp, $mode)) {
+    @unlink($temp);
+    throw new RuntimeException('Cannot prepare the update. Check folder permissions and free disk space.');
+  }
+  return $temp;
+}
+
+function ceol_discard_update_cache(string $sourceHash): void {
+  try {
+    ceol_mutate_json(CEOL_PREFS_FILE, '', ceol_default_preferences(), function ($data) use ($sourceHash) {
+      if (isset($data['updateCache']['sourceHash']) && $data['updateCache']['sourceHash'] === $sourceHash) unset($data['updateCache']);
+      return $data;
+    });
+  } catch (RuntimeException $error) { /* An unavailable cache must not mask the update error. */ }
+}
+
+function ceol_install_update(array $offer): void {
+  $file = realpath(__FILE__);
+  if ($file === false) throw new RuntimeException('Cannot locate the running application file.');
+  $lock = @fopen($file . '.update.lock', 'c');
+  if (!$lock) throw new RuntimeException('Give PHP write permission to the application folder before updating.');
+  @chmod($file . '.update.lock', 0600);
+  $temp = false;
+  $backupTemp = false;
+  try {
+    if (!flock($lock, LOCK_EX | LOCK_NB)) throw new RuntimeException('Another update is in progress. Wait, then reload the page.');
+    $current = @file_get_contents($file);
+    if ($current === false || !hash_equals($offer['localHash'], hash('sha256', $current))) {
+      throw new RuntimeException('The local application changed after the check. Reload and check for updates again.');
+    }
+    $source = ceol_download_update();
+    if (!hash_equals($offer['sourceHash'], hash('sha256', $source)) || ceol_source_version($source) !== $offer['version']) {
+      ceol_discard_update_cache($offer['sourceHash']);
+      throw new RuntimeException('The GitHub release changed after your confirmation. Check again and confirm the new release.');
+    }
+    if (!version_compare($offer['version'], APP_VERSION, '>')) throw new RuntimeException('Only a newer version can be installed.');
+    if (!function_exists('token_get_all') || !defined('TOKEN_PARSE')) {
+      throw new RuntimeException('Enable the PHP tokenizer extension so the update can be checked before installation.');
+    }
+    try { token_get_all($source, TOKEN_PARSE); }
+    catch (Throwable $error) { throw new RuntimeException('The update has PHP syntax incompatible with this server. Nothing was installed.'); }
+    $permissions = @fileperms($file);
+    if ($permissions === false) throw new RuntimeException('Cannot read application file permissions.');
+    $temp = ceol_stage_update_file($file, $source, $permissions & 0777);
+    // __halt_compiler prevents the original PHP code (including strict_types) from
+    // being parsed or executed. Remove the first line to restore this backup.
+    $backup = __DIR__ . '/.denon-ceol-backup.php';
+    $guard = "<?php http_response_code(404); exit; __halt_compiler(); ?>\n";
+    $backupTemp = ceol_stage_update_file($backup, $guard . $current, 0600);
+    if (!@rename($backupTemp, $backup)) throw new RuntimeException('Cannot save the recovery backup. Nothing was installed.');
+    $backupTemp = false;
+    if (!@rename($temp, $file)) throw new RuntimeException('Cannot replace the application file. The current version is still running.');
+    $temp = false;
+    clearstatcache(true, $file);
+    if (function_exists('opcache_invalidate')) @opcache_invalidate($file, true);
+  } finally {
+    if ($temp !== false) @unlink($temp);
+    if ($backupTemp !== false) @unlink($backupTemp);
+    flock($lock, LOCK_UN);
+    fclose($lock);
+  }
+}
+
+function ceol_update_route(string $action): void {
+  if ($action === 'update_check') {
+    $prefs = ceol_preferences();
+    $cache = isset($prefs['updateCache']) && is_array($prefs['updateCache']) ? $prefs['updateCache'] : array();
+    $validCache = isset($cache['checkedAt'], $cache['version'], $cache['sourceHash'])
+      && is_int($cache['checkedAt']) && $cache['checkedAt'] <= time()
+      && is_string($cache['version']) && preg_match('/^\d+\.\d+\.\d+$/', $cache['version'])
+      && is_string($cache['sourceHash']) && preg_match('/^[a-f0-9]{64}$/', $cache['sourceHash']);
+    $age = $validCache ? time() - $cache['checkedAt'] : PHP_INT_MAX;
+    $force = isset($_POST['force']) && $_POST['force'] === '1';
+    // A short shared cooldown prevents repeated manual checks from flooding GitHub.
+    if ($age >= CEOL_UPDATE_CACHE_SECONDS || ($force && $age >= 30)) {
+      $source = ceol_download_update();
+      $cache = array('checkedAt' => time(), 'version' => ceol_source_version($source), 'sourceHash' => hash('sha256', $source));
+      // Cache writes do not change the layout revision or invalidate editor drafts.
+      try {
+        ceol_mutate_json(CEOL_PREFS_FILE, '', ceol_default_preferences(), function ($data) use ($cache) {
+          $data['updateCache'] = $cache;
+          return $data;
+        });
+      } catch (RuntimeException $error) { /* Checking also works on a read-only deployment. */ }
+    }
+    $available = version_compare($cache['version'], APP_VERSION, '>');
+    $ticket = '';
+    if ($available) {
+      $localHash = @hash_file('sha256', __FILE__);
+      if ($localHash === false) throw new RuntimeException('Cannot read the local application file.');
+      $ticket = bin2hex(random_bytes(24));
+      $_SESSION['ceol_update_offer'] = array('ticket' => $ticket, 'version' => $cache['version'],
+        'sourceHash' => $cache['sourceHash'], 'localHash' => $localHash, 'expires' => time() + 3600);
+    } else unset($_SESSION['ceol_update_offer']);
+    json_out(array('ok' => true, 'currentVersion' => APP_VERSION, 'latestVersion' => $cache['version'],
+      'available' => $available, 'ticket' => $ticket, 'checkedAt' => $cache['checkedAt']));
+  }
+  if ($action === 'update_install') {
+    ceol_require_editor();
+    $ticket = isset($_POST['ticket']) && is_string($_POST['ticket']) ? $_POST['ticket'] : '';
+    $version = isset($_POST['version']) && is_string($_POST['version']) ? $_POST['version'] : '';
+    $offer = isset($_SESSION['ceol_update_offer']) ? $_SESSION['ceol_update_offer'] : array();
+    if (!isset($_POST['confirmed']) || $_POST['confirmed'] !== '1' || empty($offer['ticket'])
+        || !hash_equals($offer['ticket'], $ticket) || $version !== $offer['version'] || $offer['expires'] < time()) {
+      throw new RuntimeException('Check for updates and confirm the version to install first.');
+    }
+    ceol_install_update($offer);
+    unset($_SESSION['ceol_update_offer']);
+    json_out(array('ok' => true, 'version' => $offer['version']));
+  }
+}
+
 function ceol_text($value, int $limit): string {
   if (!is_string($value) || strlen($value) > $limit * 4 || preg_match('/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/', $value)) {
     throw new RuntimeException('A text property is invalid or too long.');
@@ -765,6 +958,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['ajax'])) {
   $action = isset($_POST['action']) && is_string($_POST['action']) ? $_POST['action'] : '';
   try {
     ceol_require_csrf();
+    ceol_update_route($action);
     ceol_skin_route($action);
   } catch (Throwable $error) {
     if (http_response_code() < 400) http_response_code(400);
@@ -887,7 +1081,8 @@ try {
 if ($ceolPrefs['denonIp'] === '') $ceolPrefs['denonIp'] = $configuredIp;
 $ceolBoot = array('preferences' => $ceolPrefs, 'csrf' => $_SESSION['ceol_csrf'],
   'setupRequired' => empty($ceolSecurity['passwordHash']), 'authenticated' => ceol_editor_authenticated($ceolSecurity),
-  'allowedCommands' => allowed_fixed_commands(), 'storageError' => $ceolStorageError);
+  'allowedCommands' => allowed_fixed_commands(), 'storageError' => $ceolStorageError,
+  'version' => APP_VERSION);
 header('Cache-Control: no-store, private');
 header('X-Content-Type-Options: nosniff');
 header('Referrer-Policy: same-origin');
@@ -967,6 +1162,11 @@ header('Referrer-Policy: same-origin');
     .label-node .node-face { border:0; background:transparent; box-shadow:none; padding:0; }
     .panel-node .node-face { background:var(--node-background,var(--button)); pointer-events:none; box-shadow:none; }
     .app-footer { display:flex; justify-content:space-between; gap:15px; flex-wrap:wrap; font-size:11px; color:var(--muted); margin-top:20px; }
+    .update-link { background:none; border:0; padding:0; color:var(--muted); font-size:11px; text-decoration:underline; text-underline-offset:3px; }
+    .update-link.available { color:var(--accent); font-weight:700; }
+    .update-versions { display:flex; align-items:center; justify-content:center; gap:20px; padding:20px; margin:16px 0; border:1px solid var(--border); border-radius:12px; }
+    .update-versions strong { display:block; margin-top:4px; font-size:20px; color:var(--text); }
+    .update-source { color:var(--accent); overflow-wrap:anywhere; }
     .overlay { position:fixed; inset:0; z-index:100; display:grid; place-items:center; background:#0b142c80; backdrop-filter:blur(7px); padding:20px; }
     .dialog { background:var(--surface); color:var(--text); border:1px solid var(--border); border-radius:20px; box-shadow:0 30px 100px #00000030; width:min(100%,460px); max-height:90vh; overflow:auto; padding:24px; }
     .dialog.wide { width:min(100%,940px); }
@@ -1107,7 +1307,7 @@ header('Referrer-Policy: same-origin');
     <section class="runtime-stage mini" id="runtimeStage" aria-label="Denon remote">
       <div class="canvas-viewport" id="runtimeViewport"><div class="skin-canvas" id="runtimeCanvas"></div></div>
     </section>
-    <footer class="app-footer"><span>CEOL / RCD-N9 · TCP/IP remote</span><span id="footerState">Ready when you are.</span><span><?= h(APP_VERSION) ?></span></footer>
+    <footer class="app-footer"><span>CEOL / RCD-N9 · TCP/IP remote</span><span id="footerState">Ready when you are.</span><span class="inline"><span>v<?= h(APP_VERSION) ?></span><button class="update-link" id="checkUpdatesButton" type="button">Check for updates</button></span></footer>
   </main>
 
   <div class="overlay" id="ipModal" hidden>
@@ -1123,6 +1323,17 @@ header('Referrer-Policy: same-origin');
     <div class="dialog wide" role="dialog" aria-modal="true" aria-labelledby="themesTitle">
       <div class="dialog-head"><div><h2 id="themesTitle">Find your finish.</h2><p>Ten built-in themes. Your custom layouts live here too.</p></div><button class="ui-btn icon" type="button" data-close="themesModal" aria-label="Close">×</button></div>
       <div id="themeGallery"></div>
+    </div>
+  </div>
+  <div class="overlay" id="updateModal" style="z-index:280" hidden>
+    <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="updateTitle" aria-describedby="updateDescription">
+      <div class="dialog-head"><h2 id="updateTitle">Software updates</h2><button class="ui-btn icon" id="closeUpdateButton" type="button" data-close="updateModal" aria-label="Close">×</button></div>
+      <p id="updateDescription" aria-live="polite">Checking GitHub for a newer version…</p>
+      <div class="update-versions" id="updateVersions" hidden><div><span class="eyebrow">Installed</span><strong id="installedVersion"></strong></div><span aria-hidden="true">→</span><div><span class="eyebrow">Available</span><strong id="availableVersion"></strong></div></div>
+      <p id="updatePreservation" hidden>Your saved themes, settings, and admin password will be kept. A recovery backup is created before replacing the application.</p>
+      <p>Update source: <a class="update-source" href="<?= h(CEOL_REPOSITORY_URL) ?>" target="_blank" rel="noopener noreferrer">ziobit/DenonCeolRemote · main</a></p>
+      <div class="message error" id="updateError" role="alert"></div>
+      <div class="inline"><button class="ui-btn" id="laterUpdateButton" type="button" data-close="updateModal">Close</button><button class="ui-btn" id="retryUpdateButton" type="button" hidden>Check again</button><button class="ui-btn primary" id="installUpdateButton" type="button" hidden>Update now</button></div>
     </div>
   </div>
   <div class="overlay" id="authModal" style="z-index:300" hidden>
@@ -1343,6 +1554,8 @@ header('Referrer-Policy: same-origin');
     let undoStack = [], redoStack = [], dragState = null, paletteDragging = null, themeSaving = false;
     let pollTimer = null, busy = false, liveState = {power:'unknown',mute:null,volumeNumber:null,display:[],sourceRaw:''}, logLines = [];
     let toastTimer = null, heldStop = null, selectionBusy = false, resumeEditorDraft = false;
+    let authPurpose = 'editor', updateInfo = null, updateChecking = false, updateInstalling = false;
+    let dismissedUpdateVersion = '', pendingUpdateOffer = false;
     let remoteQueue = [];
     function themes() { return presets.concat(preferences.customThemes || []); }
     function findTheme(id) { return themes().find(theme => theme.id === id) || presets[0]; }
@@ -1360,7 +1573,7 @@ header('Referrer-Policy: same-origin');
       if (result.csrf) csrf=result.csrf;
       if (!result.ok) {
         if (result.authRequired) authenticated=false;
-        throw new Error(result.error || 'The request failed.');
+        const error=new Error(result.error || 'The request failed.');error.authRequired=!!result.authRequired;throw error;
       }
       return result;
     }
@@ -1722,6 +1935,7 @@ header('Referrer-Policy: same-origin');
     }
     async function requestEditor() {
       try {
+        authPurpose='editor';
         const state=await api('editor_state');resumeEditorDraft=editorOpen;
         if(!resumeEditorDraft)preferences=state.preferences;
         setupRequired=state.setupRequired;authenticated=state.authenticated;
@@ -1872,8 +2086,92 @@ header('Referrer-Policy: same-origin');
     function startPolling() {
       clearInterval(pollTimer);refreshStatus(true);pollTimer=setInterval(()=>{if(!document.hidden)refreshStatus();},3000);
     }
+
+    function updateBusy(busy) {
+      ['closeUpdateButton','laterUpdateButton','retryUpdateButton','installUpdateButton'].forEach(id=>$(id).disabled=busy);
+      $('updateModal').setAttribute('aria-busy',String(busy));
+    }
+    function renderUpdateOffer() {
+      if(!updateInfo || !updateInfo.available)return;
+      pendingUpdateOffer=false;$('updateTitle').textContent='A new version is available';
+      $('updateDescription').textContent='Install this version from GitHub? Your confirmation and admin password are required.';
+      $('installedVersion').textContent='v'+updateInfo.currentVersion;$('availableVersion').textContent='v'+updateInfo.latestVersion;
+      $('updateVersions').hidden=false;$('updatePreservation').hidden=false;$('installUpdateButton').hidden=false;
+      $('retryUpdateButton').hidden=false;$('laterUpdateButton').textContent='Later';$('updateError').textContent='';updateBusy(false);
+      showModal('updateModal','laterUpdateButton');
+    }
+    function offerPendingUpdate() {
+      if(pendingUpdateOffer && !document.hidden && !editorOpen && !updateInstalling
+          && Array.from(document.querySelectorAll('.overlay')).every(el=>el.hidden))renderUpdateOffer();
+    }
+    async function checkForUpdates(manual=false) {
+      if(updateChecking || updateInstalling)return;
+      if(!manual && !$('updateModal').hidden)return;
+      if(manual && editorOpen){notice('Close the editor before checking for updates.');return;}
+      updateChecking=true;$('checkUpdatesButton').disabled=true;
+      if(manual){
+        pendingUpdateOffer=false;
+        $('updateTitle').textContent='Software updates';$('updateDescription').textContent='Checking GitHub for a newer version…';
+        $('updateVersions').hidden=true;$('updatePreservation').hidden=true;$('installUpdateButton').hidden=true;
+        $('retryUpdateButton').hidden=true;$('laterUpdateButton').textContent='Close';$('updateError').textContent='';
+        updateBusy(false);showModal('updateModal');
+      }
+      try {
+        updateInfo=await api('update_check',{force:manual?'1':'0'});
+        $('checkUpdatesButton').classList.toggle('available',updateInfo.available);
+        $('checkUpdatesButton').textContent=updateInfo.available?'v'+updateInfo.latestVersion+' available':'Check for updates';
+        $('checkUpdatesButton').title='Last checked '+new Date(updateInfo.checkedAt*1000).toLocaleString();
+        if(updateInfo.available){
+          if(manual && !$('updateModal').hidden)renderUpdateOffer();
+          else if(!manual && updateInfo.latestVersion!==dismissedUpdateVersion){pendingUpdateOffer=true;offerPendingUpdate();}
+        }else {
+          pendingUpdateOffer=false;
+          if(manual && !$('updateModal').hidden){$('updateTitle').textContent='You’re up to date';$('updateDescription').textContent='Version '+bootData.version+' is installed. There is no newer version on GitHub.';$('retryUpdateButton').hidden=false;}
+        }
+      }catch(error){
+        if(manual && !$('updateModal').hidden){$('updateDescription').textContent='The online check could not be completed.';$('updateError').textContent=error.message;$('retryUpdateButton').hidden=false;}
+        else $('checkUpdatesButton').title=error.message;
+      }finally{updateChecking=false;$('checkUpdatesButton').disabled=false;}
+    }
+    async function requestUpdateAuth() {
+      const state=await api('editor_state');setupRequired=state.setupRequired;authenticated=state.authenticated;
+      authPurpose='update';resumeEditorDraft=false;
+      $('authTitle').textContent=setupRequired?'Create your admin password':'Authorize the update';
+      $('authDescription').textContent=setupRequired?'Choose an admin password of at least 8 characters to protect updates and the theme editor.':'Enter the admin password to install version '+updateInfo.latestVersion+'.';
+      $('authSubmit').textContent=setupRequired?'Create password & update':'Unlock & update';
+      $('confirmPasswordField').hidden=!setupRequired;$('confirmAdminPassword').required=setupRequired;
+      $('adminPassword').autocomplete=setupRequired?'new-password':'current-password';$('authError').textContent='';$('authForm').reset();showModal('authModal','adminPassword');
+    }
+    async function installUpdate() {
+      if(updateInstalling || updateChecking || !updateInfo || !updateInfo.available)return;
+      if(editorOpen && (dirty() || themeSaving)){$('updateError').textContent='Save your theme and close the editor before updating.';return;}
+      if(editorOpen && !closeEditor())return;
+      updateInstalling=true;updateBusy(true);stopHolding();clearInterval(pollTimer);
+      remoteQueue.splice(0).forEach(task=>task.resolve());$('appRoot').inert=true;
+      $('updateDescription').textContent='Downloading and checking the confirmed version… Keep this page open.';$('updateError').textContent='';
+      let installed=false;
+      try {
+        const result=await api('update_install',{ticket:updateInfo.ticket,version:updateInfo.latestVersion,confirmed:'1'});
+        installed=true;$('updateTitle').textContent='Update installed';$('updateDescription').textContent='Version '+result.version+' is installed. Reloading…';
+        setTimeout(()=>location.reload(),800);
+      }catch(error){
+        $('updateDescription').textContent='The update has not been installed.';
+        if(error.authRequired){
+          try{await requestUpdateAuth();}catch(authError){$('updateError').textContent=authError.message;}
+        }else {$('updateError').textContent=error.message;$('retryUpdateButton').hidden=false;}
+      }finally {
+        if(!installed){updateInstalling=false;updateBusy(false);$('appRoot').inert=false;if(preferences.denonIp)startPolling();}
+      }
+    }
     function showModal(id,focusId) { stopHolding();$(id).hidden=false;if(focusId)$(focusId).focus(); }
-    function hideModal(id) { $(id).hidden=true; }
+    function hideModal(id) {
+      if(id==='updateModal' && updateInstalling)return;
+      if(id==='updateModal'){dismissedUpdateVersion=updateInfo && updateInfo.available?updateInfo.latestVersion:'';pendingUpdateOffer=false;}
+      $(id).hidden=true;
+    }
+    $('checkUpdatesButton').addEventListener('click',()=>checkForUpdates(true));
+    $('retryUpdateButton').addEventListener('click',()=>checkForUpdates(true));
+    $('installUpdateButton').addEventListener('click',installUpdate);
     $('connectionButton').addEventListener('click',()=>showModal('ipModal','denonIpInput'));
     $('themesButton').addEventListener('click',()=>{renderThemeGallery();showModal('themesModal');});
     $('editorButton').addEventListener('click',requestEditor);
@@ -1889,7 +2187,7 @@ header('Referrer-Policy: same-origin');
       ev.preventDefault();$('authError').textContent='';const password=$('adminPassword').value;
       if(setupRequired && password!==$('confirmAdminPassword').value){$('authError').textContent='The passwords do not match.';return;}
       $('authSubmit').disabled=true;
-      try{const result=await api(setupRequired?'editor_setup':'editor_login',{password});authenticated=true;setupRequired=false;if(!resumeEditorDraft)preferences=result.preferences;$('authForm').reset();hideModal('authModal');if(resumeEditorDraft){resumeEditorDraft=false;notice('Editor unlocked. Your draft is still available.');}else openEditor();}
+      try{const result=await api(setupRequired?'editor_setup':'editor_login',{password});authenticated=true;setupRequired=false;if(!resumeEditorDraft)preferences=result.preferences;$('authForm').reset();hideModal('authModal');if(authPurpose==='update'){await installUpdate();}else if(resumeEditorDraft){resumeEditorDraft=false;notice('Editor unlocked. Your draft is still available.');}else openEditor();}
       catch(error){$('authError').textContent=error.message;}finally{$('authSubmit').disabled=false;}
     });
     $('passwordForm').addEventListener('submit',async ev=>{
@@ -1979,6 +2277,9 @@ header('Referrer-Policy: same-origin');
     renderPalette();applyTheme(activeTheme);setLog('Ready.');
     if(bootData.storageError)notice(bootData.storageError);
     if(preferences.denonIp)startPolling();else showModal('ipModal','denonIpInput');
+    setTimeout(()=>checkForUpdates(),1500);
+    setInterval(()=>{if(!document.hidden)checkForUpdates();},6*60*60*1000);
+    setInterval(offerPendingUpdate,2000);
   </script>
 </body>
 </html>
