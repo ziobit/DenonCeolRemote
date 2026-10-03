@@ -5,7 +5,9 @@
   Denon CEOL / RCD-N9 TCP/IP Remote
   Single-file PHP 7.2 webapp, no Bootstrap, no database.
 
-  Deploy this file on a PHP server inside the same LAN as the Denon.
+  Deploy this file on a PHP server inside the same LAN as the Denon, or on a
+  server with a VPN route into that LAN. A hosted PHP server cannot reach your
+  private Denon IP just because the browser running at home can reach it.
   The browser talks to PHP; PHP talks to the Denon over TCP port 23.
 
   Theme studio: open "Theme editor" and create your admin password on first use.
@@ -204,7 +206,9 @@ function denon_tcp_send(string $ip, array $commands, int $readMs = DENON_DEFAULT
   if (!$fp) {
     return array(
       'ok' => false,
-      'error' => 'TCP connection failed: ' . ($errstr !== '' ? $errstr : ('error ' . $errno)),
+      'error' => 'TCP ' . $ip . ':' . DENON_TCP_PORT . ' connection failed: '
+        . ($errstr !== '' ? $errstr : ('error ' . $errno))
+        . '. Check port ' . DENON_TCP_PORT . ' from the PHP host; it needs access to the Denon LAN, locally or through a VPN.',
       'lines' => array(),
       'raw' => ''
     );
@@ -265,12 +269,39 @@ function denon_tcp_send(string $ip, array $commands, int $readMs = DENON_DEFAULT
 }
 
 function denon_http_get_quiet(string $url, int $timeoutSeconds = 2): array {
+  if (function_exists('curl_init')) {
+    $request = curl_init($url);
+    if ($request === false) return array('ok' => false, 'body' => '', 'error' => 'Cannot start PHP cURL.');
+    $body = '';
+    curl_setopt_array($request, array(CURLOPT_PROXY => '', CURLOPT_FOLLOWLOCATION => false,
+      CURLOPT_CONNECTTIMEOUT => $timeoutSeconds, CURLOPT_TIMEOUT => $timeoutSeconds,
+      CURLOPT_USERAGENT => 'CEOL-PHP-Remote/' . APP_VERSION,
+      // Older Denon firmware uses a self-signed LAN HTTPS certificate. This
+      // compatibility setting applies only to the device, never to updates.
+      CURLOPT_SSL_VERIFYPEER => false, CURLOPT_SSL_VERIFYHOST => 0,
+      CURLOPT_WRITEFUNCTION => function ($handle, $chunk) use (&$body) {
+        if (strlen($body) + strlen($chunk) > 1048576) return 0;
+        $body .= $chunk;
+        return strlen($chunk);
+      }));
+    $ok = curl_exec($request);
+    $status = (int)curl_getinfo($request, CURLINFO_HTTP_CODE);
+    $error = curl_error($request);
+    curl_close($request);
+    if ($ok === false) return array('ok' => false, 'body' => '', 'error' => $error !== '' ? $error : 'HTTP connection failed.');
+    if ($status < 200 || $status >= 300) return array('ok' => false, 'body' => '', 'error' => 'The Denon returned HTTP ' . $status . ' for this command endpoint.');
+    return array('ok' => true, 'body' => $body, 'error' => '');
+  }
+  if (!filter_var(ini_get('allow_url_fopen'), FILTER_VALIDATE_BOOLEAN)) {
+    return array('ok' => false, 'body' => '', 'error' => 'PHP HTTP access is disabled: enable cURL or allow_url_fopen on the PHP host.');
+  }
   $context = stream_context_create(array(
     'http' => array(
       'method' => 'GET',
       'timeout' => $timeoutSeconds,
       'ignore_errors' => true,
-      'header' => "User-Agent: CEOL-PHP-Remote/1.0\r\n"
+      'follow_location' => 0,
+      'header' => "User-Agent: CEOL-PHP-Remote/" . APP_VERSION . "\r\n"
     ),
     'ssl' => array(
       'verify_peer' => false,
@@ -278,11 +309,17 @@ function denon_http_get_quiet(string $url, int $timeoutSeconds = 2): array {
     )
   ));
 
-  $body = @file_get_contents($url, false, $context);
+  error_clear_last();
+  $body = @file_get_contents($url, false, $context, 0, 1048577);
   if ($body === false) {
-    return array('ok' => false, 'body' => '', 'error' => 'HTTP request failed.');
+    $warning = error_get_last();
+    $detail = isset($warning['message']) ? $warning['message'] : 'HTTP connection failed.';
+    return array('ok' => false, 'body' => '', 'error' => $detail);
   }
-
+  if (strlen($body) > 1048576) return array('ok' => false, 'body' => '', 'error' => 'The Denon HTTP response exceeds 1MB.');
+  $headers = isset($http_response_header) ? $http_response_header : array();
+  $status = !empty($headers) && preg_match('/^HTTP\/\S+ (\d{3})/', $headers[0], $match) ? (int)$match[1] : 0;
+  if ($status < 200 || $status >= 300) return array('ok' => false, 'body' => '', 'error' => 'The Denon returned HTTP ' . $status . ' for this command endpoint.');
   return array('ok' => true, 'body' => $body, 'error' => '');
 }
 
@@ -306,15 +343,19 @@ function denon_http_fallback_command(string $ip, string $command): array {
 
   // RCD-N9 field reports often use HTTPS; many Denon devices also accept HTTP.
   $tries = array('http://' . $ip . $path, 'https://' . $ip . $path, 'http://' . $ip . ':8080' . $path);
-
+  $errors = array();
   foreach ($tries as $url) {
     $res = denon_http_get_quiet($url, 2);
     if ($res['ok']) {
       return array('ok' => true, 'error' => '', 'lines' => array('HTTP fallback sent: ' . $command), 'body' => $res['body']);
     }
+    $port = parse_url($url, PHP_URL_PORT);
+    if ($port === null) $port = parse_url($url, PHP_URL_SCHEME) === 'https' ? 443 : 80;
+    $errors[] = 'Port ' . $port . ': ' . $res['error'];
   }
 
-  return array('ok' => false, 'error' => 'HTTP fallback failed on ports 80/443/8080.', 'lines' => array());
+  return array('ok' => false, 'error' => 'HTTP fallback failed from the PHP host. ' . implode(' | ', $errors)
+    . ' Run PHP on the Denon LAN or connect the PHP host through a VPN.', 'lines' => array());
 }
 
 function parse_denon_state(array $lines): array {
@@ -1313,7 +1354,7 @@ header('Referrer-Policy: same-origin');
   <div class="overlay" id="ipModal" hidden>
     <form class="dialog" id="ipForm">
       <div class="dialog-head"><h2>Connect your CEOL</h2><button class="ui-btn icon" type="button" data-close="ipModal" aria-label="Close">×</button></div>
-      <p>Enter the Denon IP address. This PHP server must be on the same local network. Enable Network Control on the Denon.</p>
+      <p>Enter the Denon IP address. The PHP server sends the commands and must have access to the Denon’s local network, directly or through a VPN. Enable Network Control on the Denon.</p>
       <label class="field"><span>Denon IPv4 address</span><input id="denonIpInput" placeholder="192.168.1.45" value="<?= h($configuredIp) ?>" inputmode="decimal" autocomplete="off" required></label>
       <div class="message error" id="ipError"></div>
       <button class="ui-btn primary" type="submit">Save & connect</button>
