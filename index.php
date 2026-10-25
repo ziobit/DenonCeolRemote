@@ -1,6 +1,6 @@
 <?php
 /*
-  MICRO REMOTE V7
+  MICRO REMOTE V7 - swapped micro prev/next commands and synced mini volume chip.
 
   Denon CEOL / RCD-N9 TCP/IP Remote
   Single-file PHP 7.2 webapp, no Bootstrap, no database.
@@ -14,18 +14,37 @@
 
 declare(strict_types=1);
 
-session_start();
+// The Denon's address is kept on the server, shared by every browser and device, so the page never
+// asks for it: the default below until Change IP saves another one in DENON_IP_FILE.
+const DEFAULT_DENON_IP = '192.168.23.180';
+const DENON_IP_FILE = __DIR__ . '/denon-ip.txt';
+
+// The Denon accepts one control connection at a time, so only one page may control it (see
+// claim_session()). This file holds "<page id> <last request time>"; it is runtime state, so it
+// lives in the system temp folder. The active page asks every 3 s while visible.
+const SESSION_FILE = '/tmp/denon-ceol-session.txt';
+const SESSION_TIMEOUT_SECONDS = 10;
+const SESSION_BUSY_MESSAGE = 'A session is already active on another device.';
 
 const DENON_TCP_PORT = 23;
 const DENON_CONNECT_TIMEOUT_SECONDS = 1.2;
 const DENON_DEFAULT_READ_MS = 900;
+const DENON_BUSY_RETRY_SECONDS = 2.5; // Longer than one status poll of another client holds the Denon (about 2 s).
 const ALLOW_PUBLIC_DENON_IP = false; // Keep false unless this app is firewalled and you know what you are doing.
 const APP_TITLE = 'CEOL N9 Micro Command Deck';
 const APP_VERSION = 'micro-remote-v7-2026-06-19';
 
 function json_out(array $payload): void {
   header('Content-Type: application/json; charset=utf-8');
-  echo json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+  // The Denon sends some texts in bytes that are not valid UTF-8 (e.g. "BDFILE NAME" while the
+  // source is CD). Without JSON_INVALID_UTF8_SUBSTITUTE json_encode() returns false, the reply is
+  // empty and the page shows "Offline" although the Denon answered: substitute those bytes instead.
+  $json = json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE);
+  if ($json === false) {
+    // Never answer with an empty body: say why the reply could not be built.
+    $json = json_encode(array('ok' => false, 'error' => 'Cannot encode the reply as JSON: ' . json_last_error_msg()));
+  }
+  echo $json;
   exit;
 }
 
@@ -80,8 +99,60 @@ function validate_denon_ip(string $ip): array {
   return array(true, $ip, '');
 }
 
+// Opens SESSION_FILE locked, lets $decide(holder, last seen) say what to write back (null = leave it).
+// Returns '' or the reason the file could not be used.
+function with_session_file(callable $decide): string {
+  $fp = @fopen(SESSION_FILE, 'c+');
+  if ($fp === false) {
+    $why = error_get_last();
+    return 'Cannot open ' . SESSION_FILE . ': ' . ($why ? $why['message'] : 'unknown error');
+  }
+  flock($fp, LOCK_EX);
+  $parts = explode(' ', trim((string)stream_get_contents($fp)));
+  $write = $decide($parts[0], isset($parts[1]) ? (int)$parts[1] : 0);
+  if ($write !== null) {
+    ftruncate($fp, 0);
+    rewind($fp);
+    fwrite($fp, $write);
+    fflush($fp);
+  }
+  flock($fp, LOCK_UN);
+  fclose($fp);
+  return '';
+}
+
+// The first page to ask gets the session and keeps it while it keeps asking; any other page is
+// refused until the session is released (page hidden or closed) or SESSION_TIMEOUT_SECONDS pass
+// without news from it. Returns '' when $page may go on, otherwise why it may not.
+function claim_session(string $page): string {
+  $free = false;
+  $error = with_session_file(function (string $holder, int $seen) use ($page, &$free) {
+    $free = $holder === '' || $holder === $page || time() - $seen > SESSION_TIMEOUT_SECONDS;
+    return $free ? $page . ' ' . time() : null;
+  });
+  if ($error !== '') {
+    return $error;
+  }
+  return $free ? '' : SESSION_BUSY_MESSAGE;
+}
+
+function release_session(string $page): string {
+  return with_session_file(function (string $holder, int $seen) use ($page) {
+    return $holder === $page ? '' : null;
+  });
+}
+
 function current_denon_ip(): string {
-  return isset($_SESSION['denon_ip']) ? (string)$_SESSION['denon_ip'] : '';
+  if (is_file(DENON_IP_FILE)) {
+    $saved = @file_get_contents(DENON_IP_FILE);
+    list($ok, $ip) = validate_denon_ip($saved === false ? '' : $saved);
+    if ($ok) {
+      return $ip;
+    }
+    // Unreadable or not a LAN IPv4: report it in the PHP error log and fall back to the default.
+    error_log('denon: ignoring ' . DENON_IP_FILE . ': ' . ($saved === false ? 'cannot read it' : 'not a valid LAN IP: "' . trim($saved) . '"'));
+  }
+  return DEFAULT_DENON_IP;
 }
 
 function source_labels(): array {
@@ -156,6 +227,13 @@ function normalize_command(string $command): string {
 }
 
 function clean_denon_line(string $line): string {
+  // NSA/NSE lines 1-7 carry an attribute byte right after the line number; bit 3 (0x08) marks the
+  // line under the menu cursor. It is a control character (often "\n"), so turn it into a visible
+  // "> " for the selected line and drop it otherwise, before control characters are stripped.
+  if (preg_match('/^(NS[AE][1-7])([\x00-\x1F])(.*)$/s', $line, $m)) {
+    $line = $m[1] . ((ord($m[2]) & 0x08) ? '> ' : '') . $m[3];
+  }
+
   $line = trim($line);
   // Remove control characters except normal UTF-8 text. Denon display lines can contain UTF-8.
   $line = preg_replace('/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/', '', $line);
@@ -169,12 +247,22 @@ function denon_tcp_send(string $ip, array $commands, int $readMs = DENON_DEFAULT
 
   $errno = 0;
   $errstr = '';
-  $fp = @fsockopen($ip, DENON_TCP_PORT, $errno, $errstr, DENON_CONNECT_TIMEOUT_SECONDS);
+
+  // The Denon serves one control connection at a time and refuses others while it is held (for
+  // example by this page open on another device): keep trying for a while before giving up.
+  $giveUpAt = microtime(true) + DENON_BUSY_RETRY_SECONDS;
+  do {
+    $fp = @fsockopen($ip, DENON_TCP_PORT, $errno, $errstr, DENON_CONNECT_TIMEOUT_SECONDS);
+    if ($fp) {
+      break;
+    }
+    usleep(100000);
+  } while (microtime(true) < $giveUpAt);
 
   if (!$fp) {
     return array(
       'ok' => false,
-      'error' => 'TCP connection failed: ' . ($errstr !== '' ? $errstr : ('error ' . $errno)),
+      'error' => 'TCP connection to ' . $ip . ':' . DENON_TCP_PORT . ' failed (retried for ' . DENON_BUSY_RETRY_SECONDS . ' s): ' . ($errstr !== '' ? $errstr : ('error ' . $errno)),
       'lines' => array(),
       'raw' => ''
     );
@@ -215,7 +303,8 @@ function denon_tcp_send(string $ip, array $commands, int $readMs = DENON_DEFAULT
   fclose($fp);
 
   if ($raw !== '') {
-    $parts = preg_split('/\r\n|\r|\n/', $raw);
+    // Denon replies end with CR. A bare "\n" can be the attribute byte of a display line, not a line end.
+    $parts = preg_split('/\r\n?/', $raw);
     if (is_array($parts)) {
       foreach ($parts as $part) {
         $line = clean_denon_line((string)$part);
@@ -305,6 +394,7 @@ function parse_denon_state(array $lines): array {
     'tunerFrequencyLabel' => '',
     'tunerStationName' => '',
     'tunerMode' => '',
+    'tunerBand' => '',
     'networkInfo' => array(),
     'lastLine' => count($lines) ? $lines[count($lines) - 1] : ''
   );
@@ -368,6 +458,11 @@ function parse_denon_state(array $lines): array {
       continue;
     }
 
+    if ($line === 'TMANFM' || $line === 'TMANAM') {
+      $state['tunerBand'] = substr($line, 4);
+      continue;
+    }
+
     if (strpos($line, 'TMAN') === 0) {
       $state['tunerMode'] = substr($line, 4);
       continue;
@@ -399,6 +494,25 @@ function parse_denon_state(array $lines): array {
     }
   }
 
+  // The Now Playing screen is not a menu, yet the Denon flags its artist line like the menu
+  // cursor: drop the "> " marker there (see clean_denon_line()).
+  if ($state['display'][0] === 'Now Playing') {
+    foreach ($state['display'] as $i => $text) {
+      if (strpos($text, '> ') === 0) {
+        $state['display'][$i] = substr($text, 2);
+      }
+    }
+  }
+
+  // The display mirror shows the screen of the Denon's network module (NSE). In standby or on a
+  // source that module does not handle, that screen holds leftovers such as "No Connection",
+  // which say nothing about the Denon or about the page's link to it: show the mirror empty.
+  // Network sources (Internet Radio, Server, USB, Bluetooth...) keep it: there it is meaningful.
+  $nonNetworkSources = array('SICD', 'SITUNER', 'SIFM', 'SIAM', 'SIDIGITALIN1', 'SIDIGITALIN2', 'SIANALOGIN');
+  if ($state['power'] === 'standby' || in_array($state['sourceRaw'], $nonNetworkSources, true)) {
+    $state['display'] = array_fill(0, 9, '');
+  }
+
   return $state;
 }
 
@@ -409,13 +523,14 @@ function format_tuner_frequency(string $raw): string {
 
   $n = (int)$raw;
 
-  // Denon models vary. This keeps the raw value visible and provides a reasonable FM helper label.
-  if ($n >= 76000 && $n <= 108000) {
-    return number_format($n / 1000, 3, '.', '') . ' MHz';
+  // Denon sends the frequency with two implied decimals: FM in MHz (008750 = 87.50 MHz),
+  // AM in kHz (105000 = 1050.00 kHz). Anything else is shown raw.
+  if ($n >= 7600 && $n <= 10800) {
+    return number_format($n / 100, 2, '.', '') . ' MHz';
   }
 
-  if ($n >= 520 && $n <= 1710) {
-    return $n . ' kHz';
+  if ($n >= 52000 && $n <= 171000) {
+    return number_format($n / 100, 0, '.', '') . ' kHz';
   }
 
   return $raw;
@@ -434,13 +549,36 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['ajax'])) {
       json_out(array('ok' => false, 'error' => $error));
     }
 
-    $_SESSION['denon_ip'] = $ip;
+    if (@file_put_contents(DENON_IP_FILE, $ip . "\n") === false) {
+      $why = error_get_last();
+      json_out(array('ok' => false, 'error' => 'Cannot save the IP in ' . DENON_IP_FILE . ': ' . ($why ? $why['message'] : 'unknown error') . '. The web server needs write permission on that folder.'));
+    }
     json_out(array('ok' => true, 'ip' => $ip));
   }
 
   if ($action === 'reset_ip') {
-    unset($_SESSION['denon_ip']);
-    json_out(array('ok' => true));
+    // Back to DEFAULT_DENON_IP.
+    if (is_file(DENON_IP_FILE) && !@unlink(DENON_IP_FILE)) {
+      $why = error_get_last();
+      json_out(array('ok' => false, 'error' => 'Cannot delete ' . DENON_IP_FILE . ': ' . ($why ? $why['message'] : 'unknown error')));
+    }
+    json_out(array('ok' => true, 'ip' => DEFAULT_DENON_IP));
+  }
+
+  // Everything below talks to the Denon: only the page holding the session may do it.
+  $page = isset($_POST['page']) ? (string)$_POST['page'] : '';
+  if (!preg_match('/^[0-9a-f]{32}$/', $page)) {
+    json_out(array('ok' => false, 'error' => 'Missing or invalid page id: reload the page.'));
+  }
+
+  if ($action === 'release') {
+    $error = release_session($page);
+    json_out(array('ok' => $error === '', 'error' => $error));
+  }
+
+  $refusal = claim_session($page);
+  if ($refusal !== '') {
+    json_out(array('ok' => false, 'busy' => $refusal === SESSION_BUSY_MESSAGE, 'error' => $refusal));
   }
 
   $ip = current_denon_ip();
@@ -503,7 +641,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['ajax'])) {
     $value = isset($_POST['value']) ? (int)$_POST['value'] : -1;
     $value = max(0, min(60, $value));
     $command = 'MV' . str_pad((string)$value, 2, '0', STR_PAD_LEFT);
-    $res = denon_tcp_send($ip, array($command, 'MV?', 'NSE'), 850);
+    // PW? and SI? too: without them the display mirror cannot tell a network source from CD/tuner.
+    $res = denon_tcp_send($ip, array($command, 'PW?', 'SI?', 'MV?', 'NSE'), 850);
     json_out(array('ok' => $res['ok'], 'error' => $res['error'], 'lines' => $res['lines'], 'state' => parse_denon_state($res['lines'])));
   }
 
@@ -511,7 +650,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['ajax'])) {
     $value = isset($_POST['value']) ? (int)$_POST['value'] : 1;
     $value = max(1, min(50, $value));
     $command = 'FV' . str_pad((string)$value, 2, '0', STR_PAD_LEFT);
-    $res = denon_tcp_send($ip, array($command, 'NSE'), 900);
+    $res = denon_tcp_send($ip, array($command, 'PW?', 'SI?', 'NSE'), 900);
     json_out(array('ok' => $res['ok'], 'error' => $res['error'], 'lines' => $res['lines'], 'state' => parse_denon_state($res['lines'])));
   }
 
@@ -522,8 +661,10 @@ $configuredIp = current_denon_ip();
 $sources = array(
   array('SICD', 'CD', 'optical disc'),
   array('SITUNER', 'Tuner', 'radio deck'),
-  array('SIFM', 'FM', 'frequency mode'),
-  array('SIAM', 'AM', 'frequency mode'),
+  // On the CEOL, SIFM and SIAM act like SITUNER and only toggle the band; TMANFM/TMANAM switch to the
+  // radio and set that band from any source (checked on the device).
+  array('TMANFM', 'FM', 'radio, FM band'),
+  array('TMANAM', 'AM', 'radio, AM band'),
   array('SIIRADIO', 'Internet Radio', 'stream matrix'),
   array('SISERVER', 'Server', 'media library'),
   array('SIUSB', 'USB', 'local port'),
@@ -537,23 +678,25 @@ $sources = array(
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title><?= h(APP_TITLE) ?></title>
   <style>
+    /* Light theme only (site rule): light ground, dark text, nothing dark anywhere. */
     :root {
-      --bg: #05070b;
-      --panel: rgba(12, 19, 31, 0.78);
-      --panel-2: rgba(18, 29, 47, 0.76);
-      --line: rgba(94, 234, 212, 0.26);
-      --cyan: #5eead4;
-      --cyan-2: #22d3ee;
-      --blue: #60a5fa;
-      --amber: #fbbf24;
-      --red: #fb7185;
-      --green: #86efac;
-      --text: #e8fbff;
-      --muted: #8aa4b7;
-      --shadow: 0 0 38px rgba(34, 211, 238, 0.13), 0 18px 60px rgba(0, 0, 0, 0.45);
+      color-scheme: light;
+      --panel: #ffffff;
+      --panel-2: #f5f9fa;
+      --line: rgba(13, 148, 136, 0.26);
+      --cyan: #0d9488;
+      --amber: #b45309;
+      --red: #e11d48;
+      --green: #16a34a;
+      --text: #10212d;
+      --muted: #5b6b78;
+      --screen: #e8f6f3;
+      --screen-text: #0f5f58;
+      --button: linear-gradient(180deg, #ffffff, #edf3f6);
+      --shadow: 0 1px 2px rgba(16, 33, 45, 0.06), 0 10px 28px rgba(16, 33, 45, 0.08);
       --radius: 26px;
       --vol: 0%;
     }
@@ -567,10 +710,9 @@ $sources = array(
       font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
       color: var(--text);
       background:
-        radial-gradient(circle at 20% 20%, rgba(34, 211, 238, 0.16), transparent 30%),
-        radial-gradient(circle at 82% 10%, rgba(96, 165, 250, 0.18), transparent 34%),
-        radial-gradient(circle at 50% 90%, rgba(94, 234, 212, 0.12), transparent 42%),
-        linear-gradient(135deg, #02040a 0%, #07101d 48%, #03070e 100%);
+        radial-gradient(circle at 20% 20%, rgba(13, 148, 136, 0.07), transparent 30%),
+        radial-gradient(circle at 82% 10%, rgba(37, 99, 235, 0.06), transparent 34%),
+        linear-gradient(135deg, #f7fafc 0%, #eef3f7 100%);
       overflow-x: hidden;
     }
 
@@ -580,26 +722,16 @@ $sources = array(
       inset: 0;
       pointer-events: none;
       background:
-        linear-gradient(rgba(255,255,255,0.032) 1px, transparent 1px),
-        linear-gradient(90deg, rgba(255,255,255,0.032) 1px, transparent 1px);
+        linear-gradient(rgba(16, 33, 45, 0.035) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(16, 33, 45, 0.035) 1px, transparent 1px);
       background-size: 48px 48px;
       mask-image: radial-gradient(circle at center, rgba(0,0,0,0.9), transparent 76%);
-    }
-
-    body::after {
-      content: "";
-      position: fixed;
-      inset: 0;
-      pointer-events: none;
-      background: repeating-linear-gradient(0deg, rgba(255,255,255,0.028), rgba(255,255,255,0.028) 1px, transparent 1px, transparent 5px);
-      mix-blend-mode: overlay;
-      opacity: 0.28;
     }
 
     button, input, select { font: inherit; }
 
     .wrap {
-      width: min(1440px, calc(100vw - 28px));
+      width: 1440px; /* fixed design size: fitToWindow() zooms it to the window */
       margin: 0 auto;
       padding: 24px 0 36px;
       position: relative;
@@ -626,24 +758,24 @@ $sources = array(
       border-radius: 18px;
       position: relative;
       background:
-        radial-gradient(circle at 50% 50%, rgba(94, 234, 212, 0.9), rgba(34, 211, 238, 0.18) 38%, transparent 40%),
-        conic-gradient(from 210deg, rgba(94,234,212,0.95), rgba(96,165,250,0.2), rgba(251,191,36,0.55), rgba(94,234,212,0.95));
-      box-shadow: 0 0 35px rgba(94, 234, 212, 0.28), inset 0 0 24px rgba(0,0,0,0.5);
+        radial-gradient(circle at 50% 50%, rgba(13, 148, 136, 0.85), rgba(8, 145, 178, 0.18) 38%, transparent 40%),
+        conic-gradient(from 210deg, rgba(13, 148, 136, 0.85), rgba(37, 99, 235, 0.25), rgba(245, 158, 11, 0.55), rgba(13, 148, 136, 0.85));
+      box-shadow: 0 4px 14px rgba(13, 148, 136, 0.22);
     }
 
     .logo::before, .logo::after {
       content: "";
       position: absolute;
-      border: 1px solid rgba(232,251,255,0.4);
+      border: 1px solid rgba(255, 255, 255, 0.75);
       border-radius: 50%;
       inset: 11px;
     }
 
-    .logo::after { inset: 21px; border-color: rgba(251,191,36,0.58); }
+    .logo::after { inset: 21px; border-color: rgba(180, 83, 9, 0.5); }
 
     h1 {
       margin: 0;
-      font-size: clamp(24px, 3vw, 42px);
+      font-size: 42px;
       letter-spacing: 0.08em;
       text-transform: uppercase;
       line-height: 1;
@@ -665,12 +797,11 @@ $sources = array(
       flex-wrap: wrap;
     }
 
-    .ip-pill, .status-pill, .tiny-pill {
-      border: 1px solid rgba(94, 234, 212, 0.22);
-      background: rgba(7, 12, 22, 0.62);
+    .ip-pill, .status-pill {
+      border: 1px solid var(--line);
+      background: #ffffff;
       border-radius: 999px;
       padding: 10px 14px;
-      box-shadow: inset 0 0 18px rgba(34, 211, 238, 0.05);
       color: var(--muted);
       font-size: 13px;
       letter-spacing: 0.04em;
@@ -687,10 +818,10 @@ $sources = array(
       height: 10px;
       border-radius: 50%;
       background: var(--red);
-      box-shadow: 0 0 14px var(--red);
+      box-shadow: 0 0 6px rgba(225, 29, 72, 0.5);
     }
 
-    .dot.online { background: var(--green); box-shadow: 0 0 15px var(--green); }
+    .dot.online { background: var(--green); box-shadow: 0 0 6px rgba(22, 163, 74, 0.5); }
 
 
     .mini-remote {
@@ -698,39 +829,23 @@ $sources = array(
       display: grid;
       justify-items: center;
       gap: 18px;
-      width: min(560px, 100%);
-      margin: 0 auto 22px;
+      align-content: start;
       isolation: isolate;
       padding: 22px 18px 24px;
-      border: 1px solid rgba(94, 234, 212, 0.22);
-      border-radius: 34px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
       background:
-        radial-gradient(circle at 50% 0%, rgba(94, 234, 212, 0.13), transparent 42%),
-        linear-gradient(180deg, rgba(18, 29, 47, 0.82), rgba(4, 9, 17, 0.92));
-      box-shadow: 0 22px 70px rgba(0, 0, 0, 0.45), inset 0 1px 0 rgba(255, 255, 255, 0.07);
+        radial-gradient(circle at 50% 0%, rgba(13, 148, 136, 0.08), transparent 42%),
+        linear-gradient(180deg, #ffffff, #f1f6f8);
+      box-shadow: var(--shadow);
       overflow: hidden;
     }
 
-    .mini-remote::before {
-      content: "";
-      position: absolute;
-      inset: 0;
-      pointer-events: none;
-      background:
-        radial-gradient(circle at 50% 50%, transparent 0 56%, rgba(94, 234, 212, 0.08) 57%, transparent 58%),
-        linear-gradient(115deg, transparent 0 42%, rgba(255, 255, 255, 0.06) 48%, transparent 56%);
-      opacity: 0.65;
-    }
-
     .mini-volume-chip {
-      position: absolute;
-      top: 16px;
-      right: 16px;
-      z-index: 2;
       min-width: 48px;
       height: 34px;
       padding: 0 11px;
-      border: 1px solid rgba(94, 234, 212, 0.34);
+      border: 1px solid rgba(13, 148, 136, 0.34);
       border-radius: 999px;
       display: inline-flex;
       align-items: center;
@@ -739,10 +854,8 @@ $sources = array(
       font-size: 16px;
       font-weight: 800;
       letter-spacing: 0.08em;
-      color: #e8fbff;
-      background: rgba(0, 7, 14, 0.72);
-      box-shadow: inset 0 0 18px rgba(94, 234, 212, 0.10), 0 0 22px rgba(94, 234, 212, 0.08);
-      text-shadow: 0 0 12px rgba(94, 234, 212, 0.60);
+      color: var(--text);
+      background: #ffffff;
       pointer-events: none;
     }
 
@@ -752,7 +865,7 @@ $sources = array(
       font-size: 9px;
       font-weight: 700;
       letter-spacing: 0.14em;
-      color: rgba(191, 252, 255, 0.55);
+      color: var(--muted);
     }
 
     .mini-row {
@@ -770,12 +883,10 @@ $sources = array(
       z-index: 1;
       width: min(390px, 92%);
       padding: 13px 15px;
-      border: 1px solid rgba(94, 234, 212, 0.20);
+      border: 1px solid var(--line);
       border-radius: 20px;
-      background:
-        linear-gradient(180deg, rgba(3, 10, 16, 0.92), rgba(0, 3, 8, 0.96)),
-        radial-gradient(circle at 50% 0%, rgba(94, 234, 212, 0.10), transparent 54%);
-      box-shadow: inset 0 0 28px rgba(94, 234, 212, 0.08), 0 12px 34px rgba(0, 0, 0, 0.32);
+      background: var(--screen);
+      box-shadow: inset 0 1px 3px rgba(16, 33, 45, 0.08);
       overflow: hidden;
     }
 
@@ -784,8 +895,8 @@ $sources = array(
       position: absolute;
       inset: 0;
       pointer-events: none;
-      background: repeating-linear-gradient(180deg, rgba(255, 255, 255, 0.04) 0, rgba(255, 255, 255, 0.04) 1px, transparent 1px, transparent 7px);
-      opacity: 0.22;
+      background: repeating-linear-gradient(180deg, rgba(13, 148, 136, 0.10) 0, rgba(13, 148, 136, 0.10) 1px, transparent 1px, transparent 7px);
+      opacity: 0.4;
     }
 
     .mini-display-lines {
@@ -794,11 +905,10 @@ $sources = array(
       display: grid;
       gap: 5px;
       font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-      font-size: clamp(12px, 2.8vw, 15px);
+      font-size: 15px;
       line-height: 1.12;
       letter-spacing: 0.08em;
-      color: #bffcff;
-      text-shadow: 0 0 12px rgba(94, 234, 212, 0.48);
+      color: var(--screen-text);
     }
 
     .mini-display-line {
@@ -814,13 +924,11 @@ $sources = array(
     .mini-btn {
       width: 74px;
       height: 74px;
-      border: 1px solid rgba(232, 251, 255, 0.13);
+      border: 1px solid rgba(16, 33, 45, 0.12);
       border-radius: 50%;
-      color: rgba(232, 251, 255, 0.9);
-      background:
-        radial-gradient(circle at 50% 25%, rgba(255, 255, 255, 0.08), transparent 42%),
-        linear-gradient(180deg, rgba(19, 33, 52, 0.92), rgba(3, 8, 15, 0.95));
-      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08), 0 16px 32px rgba(0, 0, 0, 0.34);
+      color: var(--text);
+      background: var(--button);
+      box-shadow: inset 0 1px 0 #ffffff, 0 4px 12px rgba(16, 33, 45, 0.10);
       cursor: pointer;
       display: grid;
       place-items: center;
@@ -831,32 +939,35 @@ $sources = array(
 
     .mini-btn:hover {
       transform: translateY(-1px);
-      border-color: rgba(94, 234, 212, 0.55);
-      color: #ffffff;
-      box-shadow: 0 0 28px rgba(94, 234, 212, 0.16), inset 0 1px 0 rgba(255, 255, 255, 0.12);
+      border-color: rgba(13, 148, 136, 0.55);
+      color: var(--cyan);
+      box-shadow: 0 0 0 3px rgba(13, 148, 136, 0.12), 0 4px 12px rgba(16, 33, 45, 0.10);
     }
 
     .mini-btn:active {
       transform: translateY(1px) scale(0.98);
-      box-shadow: inset 0 0 26px rgba(94, 234, 212, 0.12), 0 8px 18px rgba(0, 0, 0, 0.35);
+      box-shadow: inset 0 2px 6px rgba(16, 33, 45, 0.12);
     }
 
     .mini-btn.active {
-      border-color: rgba(251, 191, 36, 0.72);
-      color: #fff7d6;
-      box-shadow: 0 0 30px rgba(251, 191, 36, 0.18), inset 0 0 24px rgba(251, 191, 36, 0.08);
+      border-color: rgba(180, 83, 9, 0.6);
+      color: var(--amber);
+      background: #fff7e8;
+      box-shadow: 0 0 0 3px rgba(245, 158, 11, 0.15);
     }
 
     .mini-btn.power-active {
-      border-color: rgba(134, 239, 172, 0.64);
-      color: #dcfce7;
-      box-shadow: 0 0 32px rgba(134, 239, 172, 0.18), inset 0 0 24px rgba(134, 239, 172, 0.08);
+      border-color: rgba(22, 163, 74, 0.6);
+      color: var(--green);
+      background: #effaf2;
+      box-shadow: 0 0 0 3px rgba(22, 163, 74, 0.14);
     }
 
     .mini-btn.muted-active {
-      border-color: rgba(251, 113, 133, 0.66);
-      color: #ffe4e6;
-      box-shadow: 0 0 32px rgba(251, 113, 133, 0.18), inset 0 0 24px rgba(251, 113, 133, 0.08);
+      border-color: rgba(225, 29, 72, 0.55);
+      color: var(--red);
+      background: #fff1f3;
+      box-shadow: 0 0 0 3px rgba(225, 29, 72, 0.12);
     }
 
     .mini-btn svg {
@@ -875,8 +986,8 @@ $sources = array(
     .mini-pad {
       position: relative;
       z-index: 1;
-      width: min(286px, 82vw);
-      height: min(286px, 82vw);
+      width: 286px;
+      height: 286px;
       border-radius: 50%;
       display: grid;
       grid-template-columns: 1fr 1fr 1fr;
@@ -884,10 +995,10 @@ $sources = array(
       gap: 10px;
       padding: 14px;
       background:
-        radial-gradient(circle at 50% 50%, rgba(94, 234, 212, 0.09), transparent 52%),
-        linear-gradient(180deg, rgba(9, 18, 31, 0.9), rgba(2, 6, 12, 0.96));
-      border: 1px solid rgba(94, 234, 212, 0.17);
-      box-shadow: inset 0 0 48px rgba(0, 0, 0, 0.45), 0 18px 44px rgba(0, 0, 0, 0.38);
+        radial-gradient(circle at 50% 50%, rgba(13, 148, 136, 0.06), transparent 52%),
+        linear-gradient(180deg, #f7fafc, #e9f0f4);
+      border: 1px solid rgba(13, 148, 136, 0.18);
+      box-shadow: inset 0 2px 10px rgba(16, 33, 45, 0.07);
     }
 
     .mini-pad .mini-btn {
@@ -908,41 +1019,6 @@ $sources = array(
       stroke-width: 1.65;
     }
 
-    @media (max-width: 760px) {
-      .mini-remote {
-        position: sticky;
-        top: 8px;
-        z-index: 8;
-        margin-top: 4px;
-        border-radius: 30px;
-        padding: 20px 12px 22px;
-      }
-
-      .mini-row { gap: 14px; }
-
-      .mini-btn {
-        width: 68px;
-        height: 68px;
-      }
-    }
-
-    @media (max-width: 430px) {
-      .mini-volume-chip {
-        top: 12px;
-        right: 12px;
-        min-width: 42px;
-        height: 30px;
-        font-size: 14px;
-        padding: 0 9px;
-      }
-
-      .mini-row { gap: 10px; }
-      .mini-btn { width: 60px; height: 60px; }
-      .mini-btn svg { width: 31px; height: 31px; }
-      .mini-pad { width: min(260px, 88vw); height: min(260px, 88vw); gap: 8px; padding: 12px; }
-      .mini-display { width: 94%; padding: 11px 12px; border-radius: 17px; }
-    }
-
     .deck {
       display: grid;
       grid-template-columns: 1.05fr 1.5fr 1.05fr;
@@ -950,14 +1026,27 @@ $sources = array(
       align-items: stretch;
     }
 
+    /* Two rows: the left and middle panels share the first one, so their bottoms line up, and the
+       micro-remote boxes below them share the second one, so their tops line up and they reach the
+       bottom of the right panel, which spans both rows. The column wrappers are dissolved
+       (display: contents) so that their panel and box join the deck's grid directly. */
+    .deck {
+      grid-template-rows: auto 1fr;
+      grid-auto-flow: column;
+    }
+
+    .deck-column { display: contents; }
+
+    .deck > .panel { grid-row: span 2; }
+
     .panel {
       position: relative;
-      border: 1px solid rgba(94, 234, 212, 0.18);
+      border: 1px solid var(--line);
       background:
-        linear-gradient(145deg, rgba(255,255,255,0.055), transparent 30%),
-        linear-gradient(180deg, var(--panel), rgba(6, 12, 22, 0.82));
+        linear-gradient(145deg, rgba(13, 148, 136, 0.04), transparent 30%),
+        var(--panel);
       border-radius: var(--radius);
-      box-shadow: var(--shadow), inset 0 1px 0 rgba(255,255,255,0.06);
+      box-shadow: var(--shadow);
       overflow: hidden;
     }
 
@@ -966,7 +1055,7 @@ $sources = array(
       position: absolute;
       inset: 0;
       pointer-events: none;
-      background: linear-gradient(90deg, transparent, rgba(94,234,212,0.12), transparent);
+      background: linear-gradient(90deg, transparent, rgba(13, 148, 136, 0.06), transparent);
       transform: translateX(-120%);
       animation: sweep 7s linear infinite;
       opacity: 0.35;
@@ -985,7 +1074,7 @@ $sources = array(
       align-items: center;
       gap: 12px;
       margin-bottom: 14px;
-      color: #dffaff;
+      color: var(--text);
       text-transform: uppercase;
       letter-spacing: 0.16em;
       font-size: 12px;
@@ -996,7 +1085,7 @@ $sources = array(
       color: var(--cyan);
       font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
       font-size: 11px;
-      opacity: 0.8;
+      opacity: 0.9;
     }
 
     .source-grid {
@@ -1006,11 +1095,10 @@ $sources = array(
     }
 
     .source-btn, .cmd-btn, .ghost-btn, .danger-btn, .power-btn, .round-btn {
-      border: 1px solid rgba(94, 234, 212, 0.22);
+      border: 1px solid var(--line);
       color: var(--text);
-      background:
-        linear-gradient(180deg, rgba(20, 43, 64, 0.88), rgba(8, 15, 26, 0.82));
-      box-shadow: inset 0 1px 0 rgba(255,255,255,0.07), 0 10px 28px rgba(0,0,0,0.24);
+      background: var(--button);
+      box-shadow: inset 0 1px 0 #ffffff, 0 2px 6px rgba(16, 33, 45, 0.07);
       cursor: pointer;
       transition: transform 0.12s ease, border-color 0.12s ease, box-shadow 0.12s ease, color 0.12s ease;
       user-select: none;
@@ -1018,8 +1106,8 @@ $sources = array(
 
     .source-btn:hover, .cmd-btn:hover, .ghost-btn:hover, .danger-btn:hover, .power-btn:hover, .round-btn:hover {
       transform: translateY(-1px);
-      border-color: rgba(94,234,212,0.55);
-      box-shadow: 0 0 26px rgba(34, 211, 238, 0.16), inset 0 1px 0 rgba(255,255,255,0.1);
+      border-color: rgba(13, 148, 136, 0.6);
+      box-shadow: 0 0 0 3px rgba(13, 148, 136, 0.12), 0 2px 6px rgba(16, 33, 45, 0.07);
     }
 
     .source-btn:active, .cmd-btn:active, .ghost-btn:active, .danger-btn:active, .power-btn:active, .round-btn:active {
@@ -1049,9 +1137,10 @@ $sources = array(
     }
 
     .source-btn.active {
-      border-color: rgba(251,191,36,0.72);
-      color: #fff7d6;
-      box-shadow: 0 0 28px rgba(251,191,36,0.18), inset 0 0 28px rgba(251,191,36,0.06);
+      border-color: rgba(180, 83, 9, 0.6);
+      color: #92400e;
+      background: #fff7e8;
+      box-shadow: 0 0 0 3px rgba(245, 158, 11, 0.15);
     }
 
     .display-panel { min-height: 460px; }
@@ -1062,10 +1151,10 @@ $sources = array(
       border-radius: 24px;
       padding: 24px 22px;
       background:
-        radial-gradient(circle at 50% 0%, rgba(94,234,212,0.15), transparent 48%),
-        linear-gradient(180deg, rgba(0, 16, 20, 0.94), rgba(0, 5, 10, 0.98));
-      border: 1px solid rgba(94, 234, 212, 0.35);
-      box-shadow: inset 0 0 40px rgba(94,234,212,0.1), 0 0 40px rgba(34,211,238,0.1);
+        radial-gradient(circle at 50% 0%, rgba(13, 148, 136, 0.08), transparent 48%),
+        var(--screen);
+      border: 1px solid rgba(13, 148, 136, 0.35);
+      box-shadow: inset 0 1px 4px rgba(16, 33, 45, 0.08);
       overflow: hidden;
     }
 
@@ -1073,19 +1162,7 @@ $sources = array(
       content: "";
       position: absolute;
       inset: 0;
-      background: repeating-linear-gradient(0deg, rgba(94,234,212,0.045), rgba(94,234,212,0.045) 1px, transparent 1px, transparent 7px);
-      pointer-events: none;
-    }
-
-    .oled::after {
-      content: "";
-      position: absolute;
-      left: -20%;
-      top: -80%;
-      width: 140%;
-      height: 180%;
-      transform: rotate(8deg);
-      background: linear-gradient(90deg, transparent, rgba(255,255,255,0.08), transparent);
+      background: repeating-linear-gradient(0deg, rgba(13, 148, 136, 0.05), rgba(13, 148, 136, 0.05) 1px, transparent 1px, transparent 7px);
       pointer-events: none;
     }
 
@@ -1095,13 +1172,12 @@ $sources = array(
       display: grid;
       gap: 10px;
       font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-      text-shadow: 0 0 12px rgba(94,234,212,0.65);
     }
 
     .display-line {
       min-height: 22px;
-      color: var(--cyan);
-      font-size: clamp(14px, 1.4vw, 19px);
+      color: var(--screen-text);
+      font-size: 19px;
       letter-spacing: 0.05em;
       white-space: nowrap;
       overflow: hidden;
@@ -1118,8 +1194,8 @@ $sources = array(
     }
 
     .state-card {
-      border: 1px solid rgba(94, 234, 212, 0.14);
-      background: rgba(2, 9, 17, 0.55);
+      border: 1px solid var(--line);
+      background: var(--panel-2);
       border-radius: 18px;
       padding: 14px 12px;
       min-height: 70px;
@@ -1150,17 +1226,17 @@ $sources = array(
     }
 
     .volume-ring {
-      width: min(290px, 72vw);
+      width: 290px;
       aspect-ratio: 1;
       border-radius: 50%;
       position: relative;
       display: grid;
       place-items: center;
       background:
-        radial-gradient(circle, #07101c 0 49%, transparent 50%),
-        conic-gradient(var(--cyan) 0 var(--vol), rgba(94,234,212,0.08) var(--vol) 100%);
-      box-shadow: 0 0 46px rgba(94,234,212,0.16), inset 0 0 36px rgba(0,0,0,0.5);
-      border: 1px solid rgba(94,234,212,0.25);
+        radial-gradient(circle, #ffffff 0 49%, transparent 50%),
+        conic-gradient(var(--cyan) 0 var(--vol), #dde8ec var(--vol) 100%);
+      box-shadow: var(--shadow);
+      border: 1px solid var(--line);
     }
 
     .volume-ring::before {
@@ -1168,11 +1244,11 @@ $sources = array(
       position: absolute;
       inset: 18px;
       border-radius: 50%;
-      border: 1px solid rgba(255,255,255,0.08);
+      border: 1px solid rgba(16, 33, 45, 0.06);
       background:
-        radial-gradient(circle at 50% 30%, rgba(255,255,255,0.08), transparent 25%),
-        linear-gradient(180deg, rgba(12,22,35,0.95), rgba(3,8,14,0.98));
-      box-shadow: inset 0 0 40px rgba(94,234,212,0.07);
+        radial-gradient(circle at 50% 30%, rgba(13, 148, 136, 0.05), transparent 25%),
+        linear-gradient(180deg, #ffffff, #f2f7f9);
+      box-shadow: inset 0 1px 6px rgba(16, 33, 45, 0.06);
     }
 
     .volume-readout {
@@ -1183,12 +1259,11 @@ $sources = array(
 
     .volume-readout .num {
       display: block;
-      font-size: clamp(54px, 8vw, 86px);
+      font-size: 86px;
       line-height: 0.9;
       font-weight: 900;
       letter-spacing: -0.08em;
-      color: #f3feff;
-      text-shadow: 0 0 24px rgba(94,234,212,0.35);
+      color: var(--text);
     }
 
     .volume-readout .unit {
@@ -1216,8 +1291,8 @@ $sources = array(
 
     .slider-wrap {
       margin-top: 16px;
-      border: 1px solid rgba(94,234,212,0.15);
-      background: rgba(2,9,17,0.45);
+      border: 1px solid var(--line);
+      background: var(--panel-2);
       border-radius: 20px;
       padding: 15px;
     }
@@ -1244,8 +1319,8 @@ $sources = array(
       letter-spacing: 0.05em;
     }
 
-    .power-btn.on { border-color: rgba(134,239,172,0.55); }
-    .power-btn.off, .danger-btn { border-color: rgba(251,113,133,0.45); }
+    .power-btn.on { border-color: rgba(22, 163, 74, 0.55); }
+    .power-btn.off, .danger-btn { border-color: rgba(225, 29, 72, 0.45); }
     .ghost-btn { color: var(--muted); }
 
     .field-row {
@@ -1258,26 +1333,26 @@ $sources = array(
     .field-row input {
       flex: 1;
       min-width: 0;
-      border: 1px solid rgba(94,234,212,0.22);
+      border: 1px solid var(--line);
       border-radius: 16px;
-      background: rgba(2, 8, 15, 0.82);
+      background: #ffffff;
       color: var(--text);
       padding: 13px 14px;
       outline: none;
     }
 
-    .field-row input:focus { border-color: rgba(94,234,212,0.55); box-shadow: 0 0 20px rgba(34,211,238,0.12); }
+    .field-row input:focus { border-color: rgba(13, 148, 136, 0.6); box-shadow: 0 0 0 3px rgba(13, 148, 136, 0.14); }
 
     .log {
       max-height: 190px;
       overflow: auto;
       border-radius: 18px;
-      border: 1px solid rgba(94,234,212,0.13);
-      background: rgba(1, 6, 11, 0.72);
+      border: 1px solid var(--line);
+      background: var(--panel-2);
       padding: 12px;
       font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
       font-size: 12px;
-      color: #b7f7ff;
+      color: #134e4a;
       white-space: pre-wrap;
     }
 
@@ -1294,18 +1369,18 @@ $sources = array(
       display: <?= $configuredIp === '' ? 'grid' : 'none' ?>;
       place-items: center;
       padding: 20px;
-      background: rgba(0, 3, 8, 0.78);
-      backdrop-filter: blur(16px);
+      background: rgba(243, 246, 249, 0.82);
+      backdrop-filter: blur(8px);
     }
 
     .modal-card {
       width: min(620px, 100%);
       border-radius: 30px;
-      border: 1px solid rgba(94,234,212,0.28);
+      border: 1px solid var(--line);
       background:
-        radial-gradient(circle at 50% 0%, rgba(94,234,212,0.15), transparent 38%),
-        linear-gradient(180deg, rgba(13,24,39,0.96), rgba(4,9,17,0.98));
-      box-shadow: 0 0 60px rgba(94,234,212,0.18), 0 28px 80px rgba(0,0,0,0.62);
+        radial-gradient(circle at 50% 0%, rgba(13, 148, 136, 0.08), transparent 38%),
+        #ffffff;
+      box-shadow: 0 24px 70px rgba(16, 33, 45, 0.18);
       padding: 28px;
       position: relative;
       overflow: hidden;
@@ -1332,8 +1407,8 @@ $sources = array(
 
     .connect-form input {
       width: 100%;
-      border: 1px solid rgba(94,234,212,0.28);
-      background: rgba(1,6,11,0.85);
+      border: 1px solid var(--line);
+      background: #ffffff;
       color: var(--text);
       border-radius: 18px;
       padding: 16px 15px;
@@ -1342,10 +1417,10 @@ $sources = array(
       letter-spacing: 0.03em;
     }
 
-    .connect-form button, .primary-btn {
-      border: 1px solid rgba(94,234,212,0.55);
-      background: linear-gradient(180deg, rgba(94,234,212,0.28), rgba(34,211,238,0.12));
-      color: var(--text);
+    .connect-form button {
+      border: 1px solid rgba(13, 148, 136, 0.55);
+      background: #d5f3ee;
+      color: var(--screen-text);
       border-radius: 18px;
       padding: 14px 18px;
       cursor: pointer;
@@ -1357,9 +1432,9 @@ $sources = array(
     .error-box {
       display: none;
       margin-top: 14px;
-      border: 1px solid rgba(251,113,133,0.35);
-      background: rgba(251,113,133,0.09);
-      color: #fecdd3;
+      border: 1px solid rgba(225, 29, 72, 0.35);
+      background: #fff1f3;
+      color: #9f1239;
       padding: 12px 14px;
       border-radius: 16px;
     }
@@ -1379,28 +1454,210 @@ $sources = array(
     .mt { margin-top: 18px; }
     .mb { margin-bottom: 18px; }
 
-    @media (max-width: 1160px) {
-      .deck { grid-template-columns: 1fr; }
-      .display-panel { min-height: auto; }
+    .tabbar { display: none; }
+
+    /* Phone layout (designed for the iPhone 14: 390 x 844, about 390 x 660 inside Safari): the same
+       controls, one section per tab, with a tab bar at the bottom. Elements carry data-tab with the
+       tab(s) they belong to; <body data-tab> is the tab on screen. */
+    @media (max-width: 600px), (max-height: 500px) { /* same query as PHONE_LAYOUT in the script */
+      .wrap {
+        width: auto;
+        padding: calc(8px + env(safe-area-inset-top)) 12px calc(76px + env(safe-area-inset-bottom));
+      }
+
+      body[data-tab="remote"] [data-tab]:not([data-tab~="remote"]),
+      body[data-tab="sources"] [data-tab]:not([data-tab~="sources"]),
+      body[data-tab="browse"] [data-tab]:not([data-tab~="browse"]),
+      body[data-tab="volume"] [data-tab]:not([data-tab~="volume"]),
+      body[data-tab="tools"] [data-tab]:not([data-tab~="tools"]) { display: none; }
+
+      button { touch-action: manipulation; } /* no double-tap zoom on fast repeated taps */
+
+      /* Top bar: one compact line (IP and Change IP appear in the Tools tab only). */
+      .topbar { flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
+      .brand { gap: 9px; }
+      .logo { width: 30px; height: 30px; border-radius: 9px; }
+      .logo::before { inset: 6px; }
+      .logo::after { inset: 11px; }
+      h1 { font-size: 12px; letter-spacing: 0.04em; }
+      .subtitle { display: none; }
+      .top-actions { gap: 6px; margin-left: auto; }
+      .ip-pill, .status-pill { padding: 6px 10px; font-size: 12px; }
+      .top-actions .ghost-btn { min-height: 0; padding: 6px 10px; font-size: 12px; border-radius: 999px; }
+
+      .deck { display: flex; flex-direction: column; gap: 12px; }
+      .panel-inner { padding: 14px; }
+      .section-title { margin-bottom: 10px; font-size: 11px; }
+      .mt { margin-top: 14px; }
+      .cmd-btn, .ghost-btn, .power-btn { min-height: 44px; padding: 10px 8px; border-radius: 14px; }
+      .power-grid, .transport-grid, .tuner-grid, .utility-grid { gap: 8px; }
+
+      /* Remote */
+      .mini-remote { padding: 14px 12px; gap: 12px; }
+      .mini-row { gap: 12px; }
+      .mini-btn { width: 54px; height: 54px; }
+      .mini-btn svg, .mini-btn.mini-source svg { width: 28px; height: 28px; }
+      .mini-display { width: 100%; padding: 11px 13px; border-radius: 16px; }
+      .mini-pad { width: 220px; height: 220px; gap: 8px; padding: 11px; }
+      .mini-enter svg { width: 32px; height: 32px; }
+
+      /* Sources: three per row */
+      .source-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+      .source-btn { min-height: 58px; padding: 9px; border-radius: 14px; }
+      .source-btn strong { font-size: 13px; letter-spacing: 0.02em; }
+      .source-btn span { font-size: 9px; letter-spacing: 0.08em; }
+
+      /* Browse */
+      .display-panel { min-height: 0; }
+      .oled { min-height: 0; padding: 12px 14px; border-radius: 16px; }
+      .display-lines { gap: 4px; }
+      .display-line { min-height: 16px; font-size: 13px; }
+      .state-row { grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 6px; margin-top: 10px; }
+      .state-card { min-height: 0; padding: 8px; border-radius: 12px; }
+      .state-card small { margin-bottom: 4px; font-size: 8px; }
+      .state-card b { font-size: 12px; }
+
+      /* Volume */
+      .volume-stage { padding: 0 0 4px; }
+      .volume-ring { width: 180px; }
+      .volume-ring::before { inset: 14px; }
+      .volume-readout .num { font-size: 58px; }
+      .volume-controls { gap: 10px; margin-top: 10px; }
+      .round-btn { min-height: 52px; border-radius: 16px; font-size: 28px; }
+      .slider-wrap { margin-top: 10px; padding: 10px 14px; border-radius: 16px; }
+      .field-row { margin-top: 8px; }
+      .field-row input { padding: 10px 12px; border-radius: 14px; }
+
+      /* Tools: Diagnostics is the first block of the tab, so no top margin */
+      .panel-inner > .mt[data-tab="tools"] { margin-top: 0; }
+      .log { max-height: 280px; }
+
+      .tabbar {
+        position: fixed;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        z-index: 20;
+        display: grid;
+        grid-template-columns: repeat(5, minmax(0, 1fr));
+        padding: 6px 6px calc(6px + env(safe-area-inset-bottom));
+        border-top: 1px solid var(--line);
+        background: rgba(255, 255, 255, 0.95);
+        backdrop-filter: blur(10px);
+      }
+
+      .tabbar button {
+        display: grid;
+        justify-items: center;
+        gap: 3px;
+        padding: 6px 0;
+        border: 0;
+        background: none;
+        color: var(--muted);
+        font-size: 10px;
+        font-weight: 700;
+        letter-spacing: 0.04em;
+        cursor: pointer;
+        -webkit-tap-highlight-color: transparent;
+      }
+
+      .tabbar button.active { color: var(--cyan); }
+
+      .tabbar svg {
+        width: 24px;
+        height: 24px;
+        fill: none;
+        stroke: currentColor;
+        stroke-width: 1.8;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+      }
     }
 
-    @media (max-width: 760px) {
-      .topbar { align-items: flex-start; flex-direction: column; }
-      .top-actions { justify-content: flex-start; width: 100%; }
-      .source-grid, .power-grid, .transport-grid, .tuner-grid, .utility-grid { grid-template-columns: 1fr 1fr; }
-      .state-row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-      .connect-form { grid-template-columns: 1fr; }
-      .panel-inner { padding: 16px; }
-    }
+    /* Phone held sideways (iPhone 14: 844 x 390, about 844 x 340 inside Safari): the tab bar becomes
+       a rail on the left and each tab's content is split in two columns to fit the low screen. */
+    @media (max-height: 500px) {
+      .wrap {
+        padding: 6px calc(12px + env(safe-area-inset-right)) 8px calc(80px + env(safe-area-inset-left));
+      }
 
-    @media (max-width: 460px) {
-      .source-grid, .power-grid, .transport-grid, .tuner-grid, .utility-grid, .volume-controls { grid-template-columns: 1fr; }
-      .state-row { grid-template-columns: 1fr; }
-      .wrap { width: min(100vw - 18px, 1440px); }
+      .topbar { margin-bottom: 8px; }
+      .logo { width: 26px; height: 26px; }
+
+      .tabbar {
+        top: 0;
+        right: auto;
+        width: calc(68px + env(safe-area-inset-left));
+        grid-template-columns: 1fr;
+        align-content: center;
+        gap: 4px;
+        padding: 8px 4px 8px calc(4px + env(safe-area-inset-left));
+        border-top: 0;
+        border-right: 1px solid var(--line);
+      }
+
+      /* The visible blocks of a tab stand side by side, sharing the width. */
+      .deck { flex-direction: row; align-items: stretch; }
+      .deck > *, .deck-column > * { flex: 1; min-width: 0; }
+
+      /* Remote: buttons and mini display | pad with the mute button beside it */
+      .mini-remote { align-content: center; }
+      .mini-remote:has(.mini-pad) { grid-auto-flow: column; justify-content: center; align-items: center; gap: 18px; }
+      .mini-pad { width: 200px; height: 200px; }
+
+      /* Sources: six per row, power controls on one row */
+      .source-grid { grid-template-columns: repeat(6, minmax(0, 1fr)); }
+      .source-btn { min-height: 52px; }
+      .power-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+      .mt { margin-top: 10px; }
+
+      /* Browse: display and status | navigation */
+      .display-panel .panel-inner {
+        display: grid;
+        grid-template-columns: 1.15fr 1fr;
+        column-gap: 16px;
+        align-content: start;
+      }
+      .display-panel .panel-inner > * { grid-column: 1; }
+      .display-panel .panel-inner > .mt { grid-column: 2; grid-row: 1 / span 3; margin-top: 0; }
+      .oled { padding: 10px 12px; }
+      .display-lines { gap: 3px; }
+      .display-line { min-height: 14px; font-size: 12px; }
+      .transport-grid .cmd-btn { min-height: 40px; }
+
+      /* Volume: ring and -/+ | slider and tuner */
+      .panel[data-tab~="volume"] .panel-inner {
+        display: grid;
+        grid-template-columns: 1fr 1.2fr;
+        grid-template-areas: "title slider" "stage tuner" "controls tuner";
+        column-gap: 16px;
+        align-items: start;
+      }
+      .panel-inner > .section-title[data-tab="volume"] { grid-area: title; }
+      .volume-stage { grid-area: stage; }
+      .volume-controls { grid-area: controls; }
+      .slider-wrap { grid-area: slider; margin-top: 0; }
+      .panel-inner > .mt[data-tab="volume"] { grid-area: tuner; }
+      .volume-ring { width: 140px; }
+      .volume-readout .num { font-size: 46px; }
+
+      /* Tools: buttons and manual command | log */
+      .panel-inner > .mt[data-tab="tools"] {
+        grid-column: 1 / -1;
+        display: grid;
+        grid-template-columns: 1fr 1.2fr;
+        grid-template-areas: "title log" "util log" "field log";
+        column-gap: 16px;
+        align-content: start;
+      }
+      .panel-inner > .mt[data-tab="tools"] > .section-title { grid-area: title; }
+      .utility-grid { grid-area: util; margin-top: 0; }
+      .panel-inner > .mt[data-tab="tools"] > .field-row { grid-area: field; }
+      .log { grid-area: log; height: 250px; max-height: 250px; margin-top: 0; }
     }
   </style>
 </head>
-<body>
+<body data-tab="remote">
   <div class="modal" id="ipModal">
     <div class="modal-card">
       <div class="logo mb"></div>
@@ -1415,58 +1672,17 @@ $sources = array(
     </div>
   </div>
 
+  <!-- Shown while another page holds the session (the Denon accepts one connection at a time). -->
+  <div class="modal" id="busyModal" style="display: none">
+    <div class="modal-card">
+      <div class="logo mb"></div>
+      <h2>CEOL busy</h2>
+      <p>A session is already active on another device.</p>
+      <p class="note">This page connects by itself as soon as that page is closed or hidden.</p>
+    </div>
+  </div>
+
   <main class="wrap">
-    <!-- MICRO_REMOTE_V7_START: icon-only mobile command center with mini display and synced volume chip -->
-    <section class="mini-remote" data-version="micro-v7" aria-label="Simplified Denon remote">
-      <div class="mini-volume-chip" id="miniVolumeNum" aria-label="Volume">--</div>
-      <div class="mini-row">
-        <button class="mini-btn" id="miniPower" type="button" aria-label="Toggle power" title="Toggle power" onclick="togglePower()">
-          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v8"></path><path d="M7.05 6.6a8 8 0 1 0 9.9 0"></path></svg>
-        </button>
-        <button class="mini-btn mini-source" id="miniServer" type="button" aria-label="Server source" title="Server" onclick="cmd('SISERVER')">
-          <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="4" width="14" height="5" rx="1.6"></rect><rect x="5" y="10.5" width="14" height="5" rx="1.6"></rect><rect x="5" y="17" width="14" height="3" rx="1.4"></rect><path d="M8 6.5h.01M8 13h.01"></path><path d="M12 20v1.2"></path></svg>
-        </button>
-        <button class="mini-btn mini-source" id="miniBt" type="button" aria-label="Bluetooth source" title="Bluetooth" onclick="cmd('SIBLUETOOTH')">
-          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 6l8 6-8 6V6z"></path><path d="M8 6l8-3v18l-8-3"></path><path d="M4 8l4 4-4 4"></path></svg>
-        </button>
-      </div>
-
-      <div class="mini-display" aria-label="Mini display rows 1, 2, 5 and 6">
-        <div class="mini-display-lines" id="miniDisplayLines">
-          <div class="mini-display-line empty">····················</div>
-          <div class="mini-display-line empty">····················</div>
-          <div class="mini-display-line empty">····················</div>
-          <div class="mini-display-line empty">····················</div>
-        </div>
-      </div>
-
-      <div class="mini-pad" aria-label="Volume and navigation pad">
-        <button class="mini-btn mini-up" id="miniVolUp" type="button" aria-label="Volume up" title="Volume up">
-          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14"></path><path d="M5 12h14"></path></svg>
-        </button>
-        <button class="mini-btn mini-left" id="miniPrev" type="button" aria-label="Previous" title="Previous">
-          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M11 6l-6 6 6 6"></path><path d="M19 6l-6 6 6 6"></path></svg>
-        </button>
-        <button class="mini-btn mini-enter" type="button" aria-label="Enter" title="Enter" onclick="cmd('NS94')">
-          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="6.5"></circle><circle cx="12" cy="12" r="1"></circle></svg>
-        </button>
-        <button class="mini-btn mini-right" id="miniNext" type="button" aria-label="Next" title="Next">
-          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 6l6 6-6 6"></path><path d="M13 6l6 6-6 6"></path></svg>
-        </button>
-        <button class="mini-btn mini-down" id="miniVolDown" type="button" aria-label="Volume down" title="Volume down">
-          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14"></path></svg>
-        </button>
-      </div>
-
-      <div class="mini-row">
-        <button class="mini-btn" id="miniMute" type="button" aria-label="Mute" title="Mute" onclick="toggleMute()" data-muted="0">
-          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 10v4h4l5 4V6l-5 4H4z"></path><path d="M16.5 9.5a4 4 0 0 1 0 5"></path><path d="M19 7a7 7 0 0 1 0 10"></path></svg>
-        </button>
-      </div>
-    </section>
-
-    <!-- MICRO_REMOTE_V7_END -->
-
     <div class="topbar">
       <div class="brand">
         <div class="logo"></div>
@@ -1477,13 +1693,14 @@ $sources = array(
       </div>
       <div class="top-actions">
         <div class="status-pill"><span class="dot" id="connDot"></span><span id="connText">Offline</span></div>
-        <div class="ip-pill">IP <b id="ipText"><?= h($configuredIp !== '' ? $configuredIp : 'not set') ?></b></div>
-        <button class="ghost-btn" type="button" onclick="showIpModal()">Change IP</button>
+        <div class="ip-pill" data-tab="tools">IP <b id="ipText"><?= h($configuredIp !== '' ? $configuredIp : 'not set') ?></b></div>
+        <button class="ghost-btn" type="button" data-tab="tools" onclick="showIpModal()">Change IP</button>
       </div>
     </div>
 
     <div class="deck">
-      <section class="panel">
+      <div class="deck-column">
+      <section class="panel" data-tab="sources">
         <div class="panel-inner">
           <div class="section-title"><span>Input Matrix</span><span class="panel-code">SI BUS</span></div>
           <div class="source-grid" id="sourceGrid">
@@ -1510,8 +1727,33 @@ $sources = array(
           </div>
         </div>
       </section>
+      <section class="mini-remote" data-tab="remote" aria-label="Simplified Denon remote: power, sources and mini display">
+      <div class="mini-row">
+        <button class="mini-btn" id="miniPower" type="button" aria-label="Toggle power" title="Toggle power" onclick="togglePower()">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v8"></path><path d="M7.05 6.6a8 8 0 1 0 9.9 0"></path></svg>
+        </button>
+        <button class="mini-btn mini-source" id="miniServer" type="button" aria-label="Server source" title="Server" onclick="cmd('SISERVER')">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="4" width="14" height="5" rx="1.6"></rect><rect x="5" y="10.5" width="14" height="5" rx="1.6"></rect><rect x="5" y="17" width="14" height="3" rx="1.4"></rect><path d="M8 6.5h.01M8 13h.01"></path><path d="M12 20v1.2"></path></svg>
+        </button>
+        <button class="mini-btn mini-source" id="miniBt" type="button" aria-label="Bluetooth source" title="Bluetooth" onclick="cmd('SIBLUETOOTH')">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 6l8 6-8 6V6z"></path><path d="M8 6l8-3v18l-8-3"></path><path d="M4 8l4 4-4 4"></path></svg>
+        </button>
+        <div class="mini-volume-chip" id="miniVolumeNum" aria-label="Volume">--</div>
+      </div>
 
-      <section class="panel display-panel">
+      <div class="mini-display" aria-label="Mini display rows 1, 2, 5 and 6">
+        <div class="mini-display-lines" id="miniDisplayLines">
+          <div class="mini-display-line empty">····················</div>
+          <div class="mini-display-line empty">····················</div>
+          <div class="mini-display-line empty">····················</div>
+          <div class="mini-display-line empty">····················</div>
+        </div>
+      </div>
+      </section>
+      </div>
+
+      <div class="deck-column">
+      <section class="panel display-panel" data-tab="browse">
         <div class="panel-inner">
           <div class="section-title"><span>Front Display Mirror</span><span class="panel-code">NSE / NSA</span></div>
           <div class="oled">
@@ -1548,11 +1790,37 @@ $sources = array(
           </div>
         </div>
       </section>
+      <section class="mini-remote" data-tab="remote" aria-label="Simplified Denon remote: volume, navigation and mute">
+      <div class="mini-pad" aria-label="Volume and navigation pad">
+        <button class="mini-btn mini-up" id="miniVolUp" type="button" aria-label="Volume up" title="Volume up">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14"></path><path d="M5 12h14"></path></svg>
+        </button>
+        <button class="mini-btn mini-left" id="miniPrev" type="button" aria-label="Previous" title="Previous">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M11 6l-6 6 6 6"></path><path d="M19 6l-6 6 6 6"></path></svg>
+        </button>
+        <button class="mini-btn mini-enter" type="button" aria-label="Enter" title="Enter" onclick="cmd('NS94')">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="6.5"></circle><circle cx="12" cy="12" r="1"></circle></svg>
+        </button>
+        <button class="mini-btn mini-right" id="miniNext" type="button" aria-label="Next" title="Next">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 6l6 6-6 6"></path><path d="M13 6l6 6-6 6"></path></svg>
+        </button>
+        <button class="mini-btn mini-down" id="miniVolDown" type="button" aria-label="Volume down" title="Volume down">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14"></path></svg>
+        </button>
+      </div>
 
-      <section class="panel">
+      <div class="mini-row">
+        <button class="mini-btn" id="miniMute" type="button" aria-label="Mute" title="Mute" onclick="toggleMute()" data-muted="0">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 10v4h4l5 4V6l-5 4H4z"></path><path d="M16.5 9.5a4 4 0 0 1 0 5"></path><path d="M19 7a7 7 0 0 1 0 10"></path></svg>
+        </button>
+      </div>
+      </section>
+      </div>
+
+      <section class="panel" data-tab="volume tools">
         <div class="panel-inner">
-          <div class="section-title"><span>Amplitude Drive</span><span class="panel-code">MV 00-60</span></div>
-          <div class="volume-stage">
+          <div class="section-title" data-tab="volume"><span>Amplitude Drive</span><span class="panel-code">MV 00-60</span></div>
+          <div class="volume-stage" data-tab="volume">
             <div class="volume-ring" id="volumeRing">
               <div class="volume-readout">
                 <span class="num" id="volumeNum">--</span>
@@ -1561,16 +1829,16 @@ $sources = array(
             </div>
           </div>
 
-          <div class="volume-controls">
+          <div class="volume-controls" data-tab="volume">
             <button class="round-btn" type="button" id="volDown">−</button>
             <button class="round-btn" type="button" id="volUp">+</button>
           </div>
 
-          <div class="slider-wrap">
+          <div class="slider-wrap" data-tab="volume">
             <input type="range" min="0" max="60" value="0" id="volumeSlider">
           </div>
 
-          <div class="mt">
+          <div class="mt" data-tab="volume">
             <div class="section-title"><span>Tuner / Channels</span><span class="panel-code">TF / FV</span></div>
             <div class="tuner-grid">
               <button class="cmd-btn" type="button" onclick="cmd('TFANDOWN')">Tune / Ch −</button>
@@ -1584,7 +1852,7 @@ $sources = array(
             </div>
           </div>
 
-          <div class="mt">
+          <div class="mt" data-tab="tools">
             <div class="section-title"><span>Diagnostics</span><span class="panel-code">RAW</span></div>
             <div class="utility-grid">
               <button class="ghost-btn" type="button" onclick="refreshStatus(true)">Refresh</button>
@@ -1603,10 +1871,22 @@ $sources = array(
     </div>
   </main>
 
+  <!-- Phone layout only (max-width: 600px): one section per tab. -->
+  <nav class="tabbar" aria-label="Sections">
+    <button type="button" class="active" data-goto="remote"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8.5"></circle><circle cx="12" cy="12" r="2.5"></circle><path d="M12 5.5v2M12 16.5v2M5.5 12h2M16.5 12h2"></path></svg><span>Remote</span></button>
+    <button type="button" data-goto="sources"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="7" height="7" rx="1.5"></rect><rect x="13" y="4" width="7" height="7" rx="1.5"></rect><rect x="4" y="13" width="7" height="7" rx="1.5"></rect><rect x="13" y="13" width="7" height="7" rx="1.5"></rect></svg><span>Sources</span></button>
+    <button type="button" data-goto="browse"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="13" rx="2"></rect><path d="M7 8.5h10M7 12.5h6M9 21h6M12 17v4"></path></svg><span>Browse</span></button>
+    <button type="button" data-goto="volume"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 10v4h4l5 4V6l-5 4H4z"></path><path d="M16.5 9.5a4 4 0 0 1 0 5"></path><path d="M19 7a7 7 0 0 1 0 10"></path></svg><span>Volume</span></button>
+    <button type="button" data-goto="tools"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"></rect><path d="M7 9l3 3-3 3M12 15h5"></path></svg><span>Tools</span></button>
+  </nav>
+
   <script>
-    const initialIp = <?= json_encode($configuredIp, JSON_UNESCAPED_SLASHES) ?>;
     let polling = null;
     let busy = false;
+    let statusInFlight = false;
+
+    // Identifies this page (each tab, each device) for the one-session-at-a-time rule on the server.
+    const PAGE_ID = Array.from(crypto.getRandomValues(new Uint8Array(16)), b => b.toString(16).padStart(2, '0')).join('');
     let lastKnownVolume = null;
     let lastKnownPower = 'unknown';
     let lastKnownMute = null;
@@ -1626,6 +1906,7 @@ $sources = array(
       const form = new FormData();
       form.append('ajax', '1');
       form.append('action', action);
+      form.append('page', PAGE_ID);
       Object.keys(data).forEach(key => form.append(key, data[key]));
 
       const res = await fetch(location.href, {
@@ -1634,8 +1915,13 @@ $sources = array(
         credentials: 'same-origin'
       });
 
-      const json = await res.json();
-      return json;
+      // Parse by hand so that a reply that is not JSON is reported with what it actually contained.
+      const text = await res.text();
+      try {
+        return JSON.parse(text);
+      } catch (err) {
+        throw new Error(action + ': HTTP ' + res.status + ', the reply is not JSON (' + (text === '' ? 'empty' : text.slice(0, 200)) + ')');
+      }
     }
 
     function showIpModal() {
@@ -1651,14 +1937,18 @@ $sources = array(
       const ip = qs('denonIpInput').value.trim();
       qs('ipError').style.display = 'none';
 
-      const json = await api('save_ip', { ip });
+      let json;
+      try {
+        json = await api('save_ip', { ip });
+      } catch (err) {
+        json = { ok: false, error: 'Cannot save the IP: ' + err.message };
+      }
       if (!json.ok) {
         qs('ipError').textContent = json.error || 'Cannot save IP.';
         qs('ipError').style.display = 'block';
         return;
       }
 
-      localStorage.setItem('denon_ceol_ip', json.ip);
       qs('ipText').textContent = json.ip;
       hideIpModal();
       setLog('IP configured: ' + json.ip);
@@ -1757,6 +2047,13 @@ $sources = array(
     }
 
     function handleResponse(json, label) {
+      // Another page holds the session: say so; the polling keeps asking until it is free.
+      qs('busyModal').style.display = json.busy === true ? 'grid' : 'none';
+      if (json.busy === true) {
+        setConnection(false, 'Busy');
+        return;
+      }
+
       if (!json.ok) {
         setConnection(false, 'Error');
         setLog('FAIL ' + (label || '') + ': ' + (json.error || 'unknown error'));
@@ -1778,12 +2075,19 @@ $sources = array(
 
     async function refreshStatus(manual = false) {
       if (busy && !manual) return;
+      // Never stack polls: while the Denon is shared with another client a reply can take longer
+      // than the 3-second interval, and queued polls would only make it worse.
+      if (statusInFlight) return;
+      statusInFlight = true;
       try {
         const json = await api('status');
         handleResponse(json, 'STATUS');
       } catch (err) {
+        // Log the reason when the link drops, not again on every 3-second poll while it stays down.
+        if (manual || qs('connText').textContent !== 'Offline') setLog('STATUS ERROR ' + err.message);
         setConnection(false, 'Offline');
-        if (manual) setLog('STATUS ERROR ' + err.message);
+      } finally {
+        statusInFlight = false;
       }
     }
 
@@ -1826,13 +2130,24 @@ $sources = array(
 
       document.querySelectorAll('.source-btn').forEach(btn => {
         const command = btn.getAttribute('data-command');
-        btn.classList.toggle('active', command === state.sourceRaw);
+        // FM and AM are the bands of the radio (source SITUNER): lit while the radio plays that band.
+        const band = command === 'TMANFM' ? 'FM' : (command === 'TMANAM' ? 'AM' : '');
+        btn.classList.toggle('active', band !== ''
+          ? state.sourceRaw === 'SITUNER' && state.tunerBand === band
+          : command === state.sourceRaw);
       });
     }
 
     function renderMiniDisplay(lines) {
       const holder = qs('miniDisplayLines');
-      const indexes = [0, 1, 4, 5]; // User-facing display rows 1, 2, 5 and 6.
+      // Four lines fit. While playing: title, track, album, time (display rows 1, 2, 5, 6). In a
+      // menu (items on rows 2-8): the title and the three items around the selected one ("> ").
+      let indexes = [0, 1, 4, 5];
+      if (lines && lines[0] !== 'Now Playing') {
+        const selected = lines.findIndex((text, i) => i >= 1 && i <= 7 && (text || '').startsWith('> '));
+        const first = selected < 0 ? 1 : Math.min(Math.max(selected - 1, 1), 5);
+        indexes = [0, first, first + 1, first + 2];
+      }
       holder.innerHTML = '';
 
       indexes.forEach(idx => {
@@ -1849,6 +2164,32 @@ $sources = array(
       refreshStatus(true);
       polling = setInterval(() => refreshStatus(false), 3000);
     }
+
+    function stopPolling() {
+      if (polling) clearInterval(polling);
+      polling = null;
+    }
+
+    // Give the session back at once; sendBeacon is still delivered while the page goes away.
+    function releaseSession() {
+      const form = new FormData();
+      form.append('ajax', '1');
+      form.append('action', 'release');
+      form.append('page', PAGE_ID);
+      navigator.sendBeacon(location.href, form);
+    }
+
+    // A page that is not visible (other tab, minimized window, phone screen off) releases the
+    // Denon for other devices and asks for it again when it is visible.
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden) {
+        stopPolling();
+        releaseSession();
+      } else {
+        startPolling();
+      }
+    });
+    window.addEventListener('pagehide', releaseSession);
 
     function bindHoldButton(id, command) {
       const btn = qs(id);
@@ -1913,6 +2254,33 @@ $sources = array(
       if (ev.key.toLowerCase() === 'r') refreshStatus(true);
     });
 
+    // Zoom the whole layout so that it fills the window without scrolling, whatever the window
+    // size: measure it unzoomed, then scale.
+    // Phones, upright or sideways: same query as the phone media query in the stylesheet.
+    const PHONE_LAYOUT = '(max-width: 600px), (max-height: 500px)';
+
+    function fitToWindow() {
+      const wrap = document.querySelector('.wrap');
+      wrap.style.zoom = '';
+      if (window.matchMedia(PHONE_LAYOUT).matches) return; // phone layout: tabs, no zoom
+      const size = wrap.getBoundingClientRect();
+      wrap.style.zoom = Math.min((window.innerWidth - 28) / size.width, (window.innerHeight - 2) / size.height);
+    }
+
+    window.addEventListener('resize', fitToWindow);
+    fitToWindow();
+
+    // Phone layout: the tab bar shows one section at a time.
+    function showTab(name) {
+      document.body.dataset.tab = name;
+      document.querySelectorAll('.tabbar button').forEach(b => b.classList.toggle('active', b.dataset.goto === name));
+      window.scrollTo(0, 0);
+    }
+
+    document.querySelectorAll('.tabbar button').forEach(btn => {
+      btn.addEventListener('click', () => showTab(btn.dataset.goto));
+    });
+
     bindHoldButton('volUp', 'MVUP');
     bindHoldButton('volDown', 'MVDOWN');
     bindHoldButton('miniVolUp', 'MVUP');
@@ -1924,17 +2292,9 @@ $sources = array(
     bindHoldButton('miniNext', 'NS9E');
 
     (function boot() {
-      const saved = localStorage.getItem('denon_ceol_ip');
-      if (!initialIp && saved) {
-        qs('denonIpInput').value = saved;
-      }
-
-      if (initialIp) {
-        setConnection(false, 'Starting');
-        startPolling();
-      } else {
-        showIpModal();
-      }
+      // The server always knows the IP (default or saved by Change IP): connect straight away.
+      setConnection(false, 'Starting');
+      if (!document.hidden) startPolling(); // opened in a background tab: wait until it is shown
     })();
   </script>
 </body>
