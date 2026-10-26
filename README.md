@@ -1,12 +1,26 @@
-Remote broke; app didn't run on latest Android, so...
-My first version was written in Borland Delphi, but I lost it somehow.
+# Denon CEOL Remote · Micro Remote V7
 
-1) Put the index.php on a webserver on the same local network (NAS, etc.). Rename it as you wish.
-2) Turn on the Denon, go to System / Network / IP Address and remember it
-3) Open a browser from your phone or on a PC on the same local network, and go to something like http://192.168.1.23/denon/yourfilename.php
-4) Insert the DENON ip on the web interface - it will be saved
+Single-file PHP 7.2+ remote for the Denon CEOL/RCD-N9. It uses no database, Composer, or JavaScript libraries.
 
-DONE!
+1. Put `index.php` on a PHP webserver that can reach the Denon on TCP port 23.
+2. Enable **Network Control / IP Control** on the Denon.
+3. Open the app. It connects to `192.168.23.180` by default; choose **Change IP** to save another address.
 
-There is a mini remote on top, so it can be used on a mobile.
-Otherwise, more or less all the commands are available.
+The selected Denon IP is stored in `denon-ip.txt` next to `index.php`, shared across browsers. The web server needs write permission on that folder. If the file is unreadable or invalid, the default IP is used and the problem is written to the PHP error log.
+
+Only one page controls the Denon at a time. Pages identify themselves with a random ID; hiding or closing the active page releases the session, and abandoned sessions expire after a timeout. The remote uses a light theme and phone-sized section tabs.
+
+`localwifi.php` is retained as a legacy redirect to the shared interface.
+
+## Regression checks
+
+Run from the repository root with PHP 7.2+ and Node 18+:
+
+```sh
+php -n -l index.php
+php -n -l localwifi.php
+php -n tests/connection_test.php
+node --test tests/*.test.cjs
+```
+
+Tests use temporary files and mocked HTTP requests; they do not contact a physical Denon.

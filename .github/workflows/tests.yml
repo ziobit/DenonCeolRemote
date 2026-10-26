@@ -1,0 +1,13 @@
+name: Connection regression checks
+on:
+  pull_request:
+  push:
+    branches: [main]
+jobs:
+  transport:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: php -n -l index.php && php -n -l localwifi.php
+      - run: php -n tests/connection_test.php
+      - run: node --test tests/*.test.cjs
